@@ -1,0 +1,7 @@
+# Reads Fusion .f3d/.f3z archives; installed from the copy in vendor/.
+-e vendor/ezf3d
+numpy
+rich
+pyyaml
+# make lint
+flake8
