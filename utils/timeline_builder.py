@@ -30,7 +30,7 @@ from .conversion_common import (
     slug,
 )
 from .fusion_design import Curve, Design, Feature, Sketch
-from .sketch_constraints import Constrainer
+from .sketch_constraints import DIMENSION_ROLE, Carried, Constrainer
 from .solid_oracle import Mesh
 from .solvecraft_session import Session
 
@@ -40,6 +40,9 @@ PARAM_UNITS = {"mm", "cm", "m", "in", "ft", "deg", "rad", ""}
 OPERATIONS = {"NewBody": "new", "Join": "join", "Cut": "cut", "new_body": "new", "join": "join", "cut": "cut", "intersect": "intersect"}
 #: Most fillet or chamfer features one Fusion fillet or chamfer may be split into.
 MAX_FILLET_PASSES = 4
+#: Cosine of the turn (46 degrees) up to which one edge runs on into the next. SolidCraft 0.8
+#: carries a fillet or chamfer on through a 45 degree corner, and not through a square one.
+SMOOTH = math.cos(math.radians(46.0))
 #: A placement closer than this to another, entry by entry, is the same placement.
 PLACEMENT_TOLERANCE = 1e-6
 #: Which outcome wins when a feature has several parts: the later in this list.
@@ -156,6 +159,115 @@ def same_edge(edge: dict, a: np.ndarray, b: np.ndarray) -> bool:
     forward = np.linalg.norm(start - a) < POINT_TOLERANCE and np.linalg.norm(end - b) < POINT_TOLERANCE
     backward = np.linalg.norm(start - b) < POINT_TOLERANCE and np.linalg.norm(end - a) < POINT_TOLERANCE
     return bool(forward or backward) or (on_span(start, a, b) and on_span(end, a, b) and on_span(middle, a, b))
+
+
+def is_straight(edge: dict) -> bool:
+    """
+    Tell whether an edge is a straight line.
+
+    Args:
+    - edge: The edge, with ``start``, ``end`` and ``mid``.
+
+    Returns:
+    - True when its midpoint is halfway between its ends.
+    """
+    start, end, middle = np.array(edge["start"]), np.array(edge["end"]), np.array(edge["mid"])
+    return float(np.linalg.norm((start + end) / 2.0 - middle)) < POINT_TOLERANCE
+
+
+def still_edge(edge: dict, target: dict) -> bool:
+    """
+    Tell whether an edge of a body is one picked earlier, or what is left of it.
+
+    A fillet or chamfer on a neighbouring edge shortens a straight edge, which
+    moves its midpoint; what is left still lies on the span it had.
+
+    Args:
+    - edge: The edge as the body has it now.
+    - target: The edge as it was when it was picked.
+
+    Returns:
+    - True when the two have the same midpoint, or the edge is a piece of a straight target.
+    """
+    if float(np.linalg.norm(np.array(edge["mid"]) - np.array(target["mid"]))) < POINT_TOLERANCE:
+        return True
+    a, b = np.array(target["start"]), np.array(target["end"])
+    return is_straight(target) and all(on_span(np.array(edge[key]), a, b) for key in ("start", "end", "mid"))
+
+
+def leaving(edge: dict, key: str) -> np.ndarray | None:
+    """
+    Find the direction an edge sets off in from one of its ends.
+
+    Args:
+    - edge: The edge, with ``start``, ``end`` and ``mid``.
+    - key: ``start`` or ``end``: the end to set off from.
+
+    Returns:
+    - The unit direction, taking a curved edge for an arc through its three
+      points; None for an edge of no length or one closed on itself.
+    """
+    here, there = np.array(edge[key]), np.array(edge["end" if key == "start" else "start"])
+    middle = np.array(edge["mid"])
+    if float(np.linalg.norm(there - here)) < POINT_TOLERANCE:
+        return None
+    if is_straight(edge):
+        return (there - here) / np.linalg.norm(there - here)
+    u, v = middle - here, there - here
+    normal = np.cross(u, v)
+    if float(normal @ normal) < POINT_TOLERANCE**2:
+        return None
+    # The centre is equally far from all three points and in their plane; the arc leaves square to its radius.
+    centre = here + (float(v @ v) * np.cross(u, normal) - float(u @ u) * np.cross(v, normal)) / (-2.0 * float(normal @ normal))
+    tangent = np.cross(normal, here - centre)
+    tangent /= np.linalg.norm(tangent)
+    return tangent if float(tangent @ u) > 0 else -tangent
+
+
+def smooth_runs(edges: list[dict]) -> list[list[dict]]:
+    """
+    Group edges into runs in which each edge runs on into the next without a sharp turn.
+
+    Args:
+    - edges: Edges of the bodies, each with its ``body``.
+
+    Returns:
+    - The runs, each a list of edges; an edge no other runs on from is a run of one.
+    """
+    run_of = list(range(len(edges)))
+
+    def root(index: int) -> int:
+        """
+        Find the run an edge is in.
+
+        Args:
+        - index: The edge's place in `edges`.
+
+        Returns:
+        - The place of the edge that stands for its run.
+        """
+        while run_of[index] != index:
+            index = run_of[index]
+        return index
+
+    for i, first in enumerate(edges):
+        for j in range(i + 1, len(edges)):
+            second = edges[j]
+            if first.get("body") != second.get("body"):
+                continue
+            for a in ("start", "end"):
+                for b in ("start", "end"):
+                    if float(np.linalg.norm(np.array(first[a]) - np.array(second[b]))) >= POINT_TOLERANCE:
+                        continue
+                    out, back = leaving(first, a), leaving(second, b)
+                    # Two edges that leave their shared end in opposite directions run straight on into one another.
+                    # Straight on gives -1; the limit allows the turn SolidCraft still carries on through.
+                    if out is not None and back is not None and float(out @ back) < -SMOOTH:
+                        run_of[root(j)] = root(i)
+    runs: dict[int, list[dict]] = {}
+    for index, edge in enumerate(edges):
+        runs.setdefault(root(index), []).append(edge)
+    return list(runs.values())
 
 
 def axis_angle(rotation: np.ndarray) -> tuple[list[float], float] | None:
@@ -487,10 +599,52 @@ class Builder:
             self.done(feature, SKIPPED, f"{feature.kind or 'unknown'} features are not rebuilt yet")
             return
         try:
+            late = self.late_dimensions(feature) if feature.kind != "Sketch" else ""
             build(feature)
         except FEATURE_ERRORS as error:
             logger.exception("%s: %s could not be rebuilt", self.design.name, feature.name)
             self.done(feature, FAILED, f"{type(error).__name__}: {error}")
+            return
+        self.part.outcomes[-1].detail += late
+
+    def late_dimensions(self, feature: Feature) -> str:
+        """
+        Place the sketch dimensions the file lists with a feature that is not a sketch.
+
+        A dimension added to a sketch after later features were made is listed
+        with the last of those, not with its sketch. The feature's own sketch
+        is tried first, then the others, newest first.
+
+        Args:
+        - feature: A timeline entry that is not a sketch.
+
+        Returns:
+        - A clause for the report, starting with ``; ``; empty when the feature lists no sketch dimension.
+        """
+        waiting = [p for p in getattr(feature.ez, "parameters", None) or [] if DIMENSION_ROLE.match(p.role or "")]
+        listed, homes = len(waiting), []
+        own = self.sketch_of(feature) if self.drawn else None
+        for sketch in ([own] if own is not None else []) + [s for s in reversed(self.drawn) if s is not own]:
+            if not waiting:
+                break
+            mark = len(self.session.script)
+            ok, error = self.session.execute("sketch.edit", {"sketch": sketch.drawn_as})
+            if not ok:
+                logger.error("%s: %s could not be opened again for the dimensions of %s: %s", self.design.name, sketch.drawn_as, feature.name, error)
+                continue
+            left = Constrainer(self.session, sketch, self.design.name).dimensions(waiting, self.names, Carried())
+            self.session.execute("sketch.finish", {})
+            if len(left) < len(waiting):
+                homes.append(sketch.drawn_as)
+            else:
+                # Nothing was added: opening and closing the sketch need not be in the script.
+                del self.session.script[mark:]
+            waiting = left
+        if not listed:
+            return ""
+        logger.info("%s: %s lists %d sketch dimensions; %d placed on %s", self.design.name, feature.name, listed, listed - len(waiting), homes or "no sketch")
+        placed = f"{listed - len(waiting)} of {listed} sketch dimensions the file lists with it placed by their value"
+        return f"; {placed} on {', '.join(homes)}" if homes else f"; {placed}"
 
     def parameters(self) -> None:
         """
@@ -808,14 +962,16 @@ class Builder:
             return
         params = {"sketch": sketch.drawn_as, "operation": operation, "name": self.label(feature)} | extent | self.taper(feature)
         params["profiles"] = [{"point": list(regions[i][0])} for i in chosen]
-        ok, error = self.session.execute("solid.extrude", params | self.bodies_for(operation))
+        ok, error, apart = self.make("solid.extrude", params, operation)
         if not ok:
             self.done(feature, FAILED, str(error))
             return
         what = f"{operation}, {len(chosen)} region(s) of {sketch.drawn_as}"
         if job.inferred:
             what += f"; {', '.join(job.inferred)} inferred from the finished solid"
-        self.done(feature, INFERRED if job.inferred else EXACT, what)
+        if apart:
+            what += f"; {apart}"
+        self.done(feature, INFERRED if job.inferred or apart else EXACT, what)
 
     @staticmethod
     def region_test(sketch: Sketch, profile: dict):
@@ -1114,6 +1270,32 @@ class Builder:
             return {"body_name": self.design.name if not self.bodies else f"{self.design.name} {len(self.bodies) + 1}"}
         return {"targets": list(self.bodies)} if self.bodies else {}
 
+    def make(self, command: str, params: dict, operation: str) -> tuple[bool, object, str]:
+        """
+        Run an extrude or a sweep, keeping a join SolidCraft refuses as a body of its own.
+
+        From 0.8 SolidCraft refuses a join it cannot fuse exactly, such as
+        curved bodies that only touch, where older builds moved the new
+        material a little to make them overlap.
+
+        Args:
+        - command: ``solid.extrude`` or ``solid.sweep``.
+        - params: Its parameters, without the bodies it makes or acts on.
+        - operation: ``new``, ``join``, ``cut`` or ``intersect``.
+
+        Returns:
+        - Whether it worked, SolidCraft's refusal if not, and a note for the
+          report when the material was made but not joined.
+        """
+        ok, error = self.session.execute(command, params | self.bodies_for(operation))
+        if ok or operation != "join" or not self.bodies:
+            return ok, error, ""
+        apart, _ = self.session.execute(command, params | {"operation": "new"} | self.bodies_for("new"))
+        if not apart:
+            return False, error, ""
+        logger.warning("%s: SolidCraft refused to join %s, so it is a body of its own: %s", self.design.name, params.get("name"), error)
+        return True, error, f"made as a body of its own, which SolidCraft refused to join to the rest ({error})"
+
     # Fillets
     def edges(self) -> list[dict]:
         """
@@ -1296,39 +1478,28 @@ class Builder:
         - How many edges were treated, how many features it took, and
           SolidCraft's last refusal.
         """
-        # Edge indices change with every fillet; midpoints do not.
-        targets = [np.array(edge["mid"]) for edge in chosen]
+        # Edge indices change with every fillet; where the edges are does not.
+        targets = list(chosen)
         treated, passes, refusal = 0, 0, ""
         while targets and passes < MAX_FILLET_PASSES:
-            picks = [edge for edge in self.edges() if self.is_at(edge, targets)]
+            picks = [edge for edge in self.edges() if any(still_edge(edge, target) for target in targets)]
             if not picks:
                 break
             before = measured(self.refresh())
             pass_name = name if passes == 0 else f"{name} (part {passes + 1})"
             ok, error = self.attempt_edges(picks, treatment, size, pass_name, before, record=True)
-            accepted = picks if ok else self.largest_set(picks, treatment, size, pass_name, before)
+            accepted, sound = (picks, picks) if ok else self.largest_set(picks, treatment, size, pass_name, before)
             if not ok:
                 refusal = error
             if not accepted:
                 break
-            treated += len(accepted)
+            left = [target for target in targets if not any(still_edge(edge, target) for edge in accepted)]
+            treated += len(targets) - len(left)
             passes += 1
-            targets = [mid for mid in targets if not self.is_at({"mid": mid}, [np.array(edge["mid"]) for edge in accepted])]
+            # An edge SolidCraft refuses on its own is not tried again: each refusal takes seconds,
+            # and the edges treated since seldom change it.
+            targets = [target for target in left if any(still_edge(edge, target) for edge in sound)]
         return treated, passes, refusal
-
-    @staticmethod
-    def is_at(edge: dict, points: list[np.ndarray]) -> bool:
-        """
-        Tell whether an edge's midpoint is one of some points.
-
-        Args:
-        - edge: The edge, with its ``mid``.
-        - points: The points.
-
-        Returns:
-        - True when its midpoint coincides with one of them.
-        """
-        return any(np.linalg.norm(np.array(edge["mid"]) - point) < POINT_TOLERANCE for point in points)
 
     def attempt_edges(self, edges: list[dict], treatment: EdgeTreatment, size: str, name: str, before: Solid | None, record: bool) -> tuple[bool, object]:
         """
@@ -1364,7 +1535,7 @@ class Builder:
             log("%s: SolidCraft's %s %s of %d edges made the body larger; undone", self.design.name, treatment.noun, name, len(edges))
         return (not grew), f"SolidCraft's {treatment.noun} of these edges together made the body larger"
 
-    def largest_set(self, picks: list[dict], treatment: EdgeTreatment, size: str, name: str, before: Solid | None) -> list[dict]:
+    def largest_set(self, picks: list[dict], treatment: EdgeTreatment, size: str, name: str, before: Solid | None) -> tuple[list[dict], list[dict]]:
         """
         Fillet or chamfer the largest set of edges SolidCraft handles together.
 
@@ -1376,15 +1547,25 @@ class Builder:
         - before: The bodies as measured before it.
 
         Returns:
-        - The edges treated; empty when SolidCraft handles none.
+        - The edges treated, empty when SolidCraft handles none; and the edges
+          it handles on their own, treated or not.
         """
+        # SolidCraft carries a fillet or chamfer along edges that run on into one
+        # another, so such a run stands or falls together: one trial tells for all of it.
+        runs = smooth_runs(picks)
+        sound = [run for run in runs if self.attempt_edges(run, treatment, size, name, before, record=False)[0]]
+        alone = [edge for run in sound for edge in run]
+        logger.debug("%s: %s: SolidCraft takes %d of %d edges on their own, in %d of %d run(s)", self.design.name, name, len(alone), len(picks), len(sound), len(runs))
+        if alone and self.attempt_edges(alone, treatment, size, name, before, record=True)[0]:
+            return alone, alone
+        # The runs it takes one by one are not always taken together: add them one at a time.
         accepted: list[dict] = []
-        for edge in picks:
-            if self.attempt_edges(accepted + [edge], treatment, size, name, before, record=False)[0]:
-                accepted.append(edge)
+        for run in sound if len(sound) > 1 else []:
+            if self.attempt_edges(accepted + run, treatment, size, name, before, record=False)[0]:
+                accepted += run
         if accepted and self.attempt_edges(accepted, treatment, size, name, before, record=True)[0]:
-            return accepted
-        return []
+            return accepted, alone
+        return [], alone
 
     # Sweeps
     def sweep(self, feature: Feature) -> None:
@@ -1421,11 +1602,13 @@ class Builder:
         path_sketch, path = found
         params = {"sketch": section.drawn_as, "path_sketch": path_sketch.drawn_as, "path": path, "operation": operation, "name": self.label(feature)}
         params["profiles"] = [{"point": list(regions[i][0])} for i in chosen]
-        ok, error = self.session.execute("solid.sweep", params | self.bodies_for(operation))
+        ok, error, apart = self.make("solid.sweep", params, operation)
         if not ok:
             self.done(feature, FAILED, str(error))
             return
         what = f"{operation}, {len(chosen)} region(s) of {section.drawn_as} along {len(path)} curve(s) of {path_sketch.drawn_as}; profile and path inferred"
+        if apart:
+            what += f"; {apart}"
         extent = definition.get("path_extent", {})
         if extent.get("along_fraction", 1.0) != 1.0 or extent.get("against_fraction", 0.0) != 0.0:
             what += "; swept along the whole path, not the part of it the file gives"

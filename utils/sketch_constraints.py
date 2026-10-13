@@ -28,6 +28,8 @@ DIMENSION_ROLE = re.compile(r"^(Linear|Radial|Diameter) Dimension\b")
 MOVED = 1e-4
 #: Two lengths closer than this (mm) are the same length.
 SAME_LENGTH = 1e-6
+#: Most places a dimension is tried on before it is given up.
+MAX_TRIES = 8
 #: What SolidCraft answers when a constraint adds nothing to those already there.
 IMPLIED = "over-constrain"
 
@@ -96,6 +98,8 @@ class Constrainer:
         self.sketch = sketch
         self.design_name = design_name
         self.shape = self.inspect()
+        #: What has a dimension already: the ids it measures and its type.
+        self.dimensioned: set[tuple] = set()
 
     def inspect(self) -> dict:
         """
@@ -155,7 +159,16 @@ class Constrainer:
         if at is None:
             return None
         near = min(self.shape.get("points", []), key=lambda p: math.dist(p["at"], at), default=None)
-        return near["id"] if near is not None and math.dist(near["at"], at) < POINT_TOLERANCE else None
+        if near is not None and math.dist(near["at"], at) < POINT_TOLERANCE:
+            return near["id"]
+        # A point no curve ends at, such as the corner a sketch fillet rounded off: drawn now that a constraint needs it.
+        ok, result = self.session.execute("sketch.point", {"point": [round(at[0], 6), round(at[1], 6)]})
+        made = result.get("created", {}).get("points", []) if ok and isinstance(result, dict) else []
+        if not made:
+            logger.debug("%s: a point of %s at %s could not be drawn: %s", self.design_name, self.sketch.drawn_as or self.sketch.id, at, result)
+            return None
+        self.shape = self.inspect()
+        return made[0]
 
     def resolve(self, reference: object) -> str | None:
         """
@@ -251,61 +264,108 @@ class Constrainer:
                 carried.refused += 1
                 logger.debug("%s: %s of %s was not kept: %s", self.design_name, kind, self.sketch.drawn_as or self.sketch.id, why)
 
-    def target(self, role: str, value: float, used: set[str]) -> tuple[str, str] | None:
+    @staticmethod
+    def off_line(line: dict, at) -> float:
         """
-        Find a curve a dimension of a given value can measure.
+        Measure how far a point is from a line, taking the line as endless.
+
+        Args:
+        - line: The line, with ``start_at`` and ``end_at``.
+        - at: The point, (u, v).
+
+        Returns:
+        - The distance square to the line; to its start when the line has no length.
+        """
+        (x1, y1), (x2, y2) = line["start_at"], line["end_at"]
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < SAME_LENGTH:
+            return math.dist(line["start_at"], at)
+        return abs((x2 - x1) * (at[1] - y1) - (y2 - y1) * (at[0] - x1)) / length
+
+    def between_points(self, value: float) -> list[tuple[list[str], str]]:
+        """
+        List the pairs of points a length could be the distance between.
+
+        Args:
+        - value: The length, in millimetres.
+
+        Returns:
+        - Each pair with the dimension type that gives that length: across,
+          up, or straight between them.  Pairs with the origin come first.
+        """
+        points = sorted(self.shape.get("points", []), key=lambda point: point["id"] != "origin")
+        found: list[tuple[list[str], str]] = []
+        for index, a in enumerate(points):
+            for b in points[index + 1:]:
+                across, up = abs(a["at"][0] - b["at"][0]), abs(a["at"][1] - b["at"][1])
+                for size, kind in ((across, "horizontal"), (up, "vertical"), (math.hypot(across, up), "distance")):
+                    # Straight between two points level with or above one another is the same as across or up.
+                    if abs(size - value) < SAME_LENGTH and not (kind == "distance" and min(across, up) < SAME_LENGTH):
+                        found.append(([a["id"], b["id"]], kind))
+        return found
+
+    def measures(self, role: str, value: float) -> list[tuple[list[str], str]]:
+        """
+        List what a dimension of a given value could measure, likeliest first.
 
         The file gives a dimension's value and whether it is a length, a radius
-        or a diameter, but not what it measures; a curve of that size is taken.
+        or a diameter, but not what it measures.  A curve of that size comes
+        first; for a length, then the origin and a line that far from it, two
+        parallel lines that far apart, and two points that far apart.
 
         Args:
         - role: ``Linear``, ``Radial`` or ``Diameter``.
         - value: The dimension's value, in millimetres or as a radius for the round kinds.
-        - used: Ids of the curves that have a dimension already.
 
         Returns:
-        - The curve's id and the dimension type, or None when no curve has that size.
+        - Each candidate: the ids of what it measures, and the dimension type.
         """
-        for curve in self.shape.get("curves", []):
-            if curve["id"] in used or curve.get("construction"):
-                continue
-            if role == "Linear" and curve.get("type") == "line":
-                size, kind = math.dist(curve["start_at"], curve["end_at"]), "length"
-            elif role != "Linear" and curve.get("radius") is not None:
-                size, kind = float(curve["radius"]), role.lower().replace("radial", "radius")
-            else:
-                continue
-            if abs(size - value) < SAME_LENGTH:
-                return curve["id"], kind
-        return None
+        curves = self.shape.get("curves", [])
+        if role != "Linear":
+            kind = role.lower().replace("radial", "radius")
+            return [([c["id"]], kind) for c in curves if not c.get("construction") and c.get("radius") is not None and abs(float(c["radius"]) - value) < SAME_LENGTH]
+        lines = [c for c in curves if c.get("type") == "line"]
+        found = [([c["id"]], "length") for c in lines if not c.get("construction") and abs(math.dist(c["start_at"], c["end_at"]) - value) < SAME_LENGTH]
+        if any(point["id"] == "origin" for point in self.shape.get("points", [])):
+            found += [(["origin", line["id"]], "distance") for line in lines if abs(self.off_line(line, (0.0, 0.0)) - value) < SAME_LENGTH]
+        for index, a in enumerate(lines):
+            for b in lines[index + 1:]:
+                # Parallel when both ends of one are as far from the other.
+                if abs(self.off_line(a, b["start_at"]) - value) < SAME_LENGTH and abs(self.off_line(a, b["end_at"]) - value) < SAME_LENGTH:
+                    found.append(([a["id"], b["id"]], "distance"))
+        return found + self.between_points(value)
 
-    def dimensions(self, parameters: list, names: dict[str, str], carried: Carried) -> None:
+    def dimensions(self, parameters: list, names: dict[str, str], carried: Carried) -> list:
         """
-        Place the sketch's dimensions on curves of their size.
+        Place dimensions on what in the sketch has their size.
 
         Args:
         - parameters: The parameters ezf3d lists for the sketch.
         - names: Fusion parameter name -> the name it has in SolidCraft.
         - carried: The tally, added to in place.
+
+        Returns:
+        - The dimensions among the parameters that found no place.
         """
-        used: set[str] = set()
+        unplaced = []
         for parameter in parameters:
             role = DIMENSION_ROLE.match(parameter.role or "")
             if role is None:
                 continue
             carried.dimensions_listed += 1
             value_mm = abs(parameter.value) * 10.0
-            found = self.target(role.group(1), value_mm / 2.0 if role.group(1) == "Diameter" else value_mm, used)
-            if found is None:
-                continue
-            curve, kind = found
             value = names.get(parameter.name) or f"{round(value_mm, 6)} mm"
-            why = self.add("sketch.dimension", {"entities": [curve], "type": kind, "value": value})
-            if why:
-                logger.debug("%s: dimension %s on %s of %s was not kept: %s", self.design_name, parameter.name, curve, self.sketch.drawn_as or self.sketch.id, why)
-                continue
-            used.add(curve)
-            carried.dimensions += 1
+            candidates = self.measures(role.group(1), value_mm / 2.0 if role.group(1) == "Diameter" else value_mm)
+            for entities, kind in [c for c in candidates if (tuple(c[0]), c[1]) not in self.dimensioned][:MAX_TRIES]:
+                why = self.add("sketch.dimension", {"entities": entities, "type": kind, "value": value})
+                if not why:
+                    self.dimensioned.add((tuple(entities), kind))
+                    carried.dimensions += 1
+                    break
+                logger.debug("%s: dimension %s on %s of %s was not kept: %s", self.design_name, parameter.name, entities, self.sketch.drawn_as or self.sketch.id, why)
+            else:
+                unplaced.append(parameter)
+        return unplaced
 
     def run(self, parameters: list, names: dict[str, str]) -> Carried:
         """

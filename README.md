@@ -10,21 +10,24 @@ This is a personal project. It has no affiliation with Autodesk, Inc. or Fusion 
 
 ## Status
 
-This is an early tool. It has been tested on two designs, with SolidCraft 0.6.0. Expect gaps on other designs.
+This is an early tool. There are likely to be small errors in any file you currently attempt to convert.
 
-| Design | Timeline steps | Failed | Skipped | Volume against the original |
-|---|---|---|---|---|
-| A `.f3z` with two parts (a base and a corner mount) | 3 and 15 | 0 | 0 | Base: matches. Mount: 45006.9 against 45330.7 mm3 |
-| A `.f3d` sensor case | 15 | 0 | 0 | 8958.0 against 8951.3 mm3 |
+No design matches its original fully yet.
 
-Neither design matches its original fully yet. The most likely cause is the SolidCraft fillet and chamfer limit under Known limits.
+Known issues:
+
+* SolidCraft refuses to fillet or chamfer some edges that Fusion accepts, so those edges stay sharp.
+* SolidCraft (as of 10/13/2026) refuses to join some curved bodies that only touch, so that material is left as a body of its own.
+* The check against the original can report a mismatch that is not in the rebuild, because cadmpeg alters some round surfaces of the original solid.
+
+Each of these is described under Known limits below.
 
 What is rebuilt today:
 
 * Parameters
 * Sketches (lines, arcs and circles, on their real planes)
 * Sketch constraints: coincident, horizontal, vertical, parallel, perpendicular, tangent, equal, concentric, collinear, midpoint and symmetric
-* Sketch dimensions (lengths, radii and diameters), driven by the same parameters as in Fusion
+* Sketch dimensions (lengths, radii, diameters and distances between points and lines), driven by the same parameters as in Fusion
 * Extrudes (new body, join and cut)
 * Sweeps of a sketch region along sketch curves
 * Fillets
@@ -35,21 +38,24 @@ What is rebuilt today:
 
 What is not rebuilt yet:
 
-* Any other feature type (revolve, loft, shell, patterns and so on). These are listed as skipped in the report.
-* Sketch offset constraints. SolidCraft has no command for them.
+* Any other feature type (revolve, loft, shell, patterns and so on).
+* Sketch offset constraints. SolidCraft's offset command draws new curves and has no way to tie existing ones together.
 * Chamfers of two distances or of a distance and an angle.
 * A linked component that is mirrored or scaled. It is left at the origin.
 
 Known limits:
 
-* The file gives a dimension's value but not what it measures. The converter puts each dimension on a curve of that size, and leaves out a dimension when no curve has it. A dimension between two points or two curves is therefore not placed.
+* The file gives a dimension's value but not what it measures. The converter puts each dimension on something of that size and leaves it out when it finds nothing. It tries, in this order: a curve of that size, the origin and a line that far from it, two parallel lines that far apart, and two points that far apart. The dimension therefore holds the right value, but may measure something other than it did in Fusion.
+* A dimension added to a sketch after later features were made is listed in the file with one of those features, not with its sketch. The converter tries that feature's own sketch first, then the other sketches, newest first.
 * A constraint or dimension is kept only if the sketch stays exactly where it was drawn. One that SolidCraft refuses, or that moves a curve, is taken back and counted in the report.
 * The file does not say which region a sweep carries, and names its path only by the number of curves. Both are worked out from the finished solid and the drawn sketches.
 * The placement of a linked component has only been tested on a component placed at the origin. A moved or turned placement is checked against what SolidCraft reports, but the units cadmpeg gives it in are assumed to be millimetres.
-* SolidCraft refuses to fillet or chamfer some edge combinations that Fusion accepts. The converter treats the edges SolidCraft allows and reports the rest. This is still so in SolidCraft 0.6.
-* SolidCraft's "hole at sketch points" mode removes the wrong material. The converter makes one hole feature per position instead. This is still so in SolidCraft 0.6.
+* SolidCraft refuses to fillet or chamfer some edge combinations that Fusion accepts. The converter treats the edges SolidCraft allows and reports the rest. This is still so in SolidCraft 0.8, where each refusal also takes about three seconds instead of a fraction of one. To keep that short, edges that run on into one another are tried as one, and an edge SolidCraft refuses on its own is not tried again.
+* SolidCraft's "hole at sketch points" mode removes the wrong material. The converter makes one hole feature per position instead. This is still so in SolidCraft 0.8.
+* SolidCraft 0.8 refuses to join curved bodies that only touch, where 0.6 moved the new material a little to make them overlap. When a join by an extrude or a sweep is refused, the converter makes the material as a body of its own and says so in the report. The part then has the right volume and size, in more than one body.
 * When two extrudes use the same sketch, the file may not say which regions each one takes. The converter gives a region to the later extrude when its material in the finished solid stops short of the earlier extrude's length.
 * A fillet or chamfer whose edges are on material an earlier failed step should have made is reported as failed. It does not guess other edges instead.
+* The check can report a mismatch that is not in the rebuild. cadmpeg alters some round surfaces to write the original solid as STEP, and the report has a note when it does. In one test design, a corner mount, four rounded edges around its holes come out bulging the wrong way, as rings of material, which adds about 500 mm3 to the original's volume of about 45000 mm3. Away from those rings the rebuilt mount is within about 25 mm3 of the original, at the corners where SolidCraft does not round two short edges. cadmpeg 0.6.1 writes the same rings, so the pinned 0.5.5 is kept.
 
 ## How it works
 
@@ -181,7 +187,7 @@ Run `main.py --help` for the full list of options.
 
 ```yaml
 # Folder holding solidcraft-cli.exe and solidcraft.exe.
-solidcraft_dir: 'C:\Tools\solidcraft-0.6.0-windows-x64-portable'
+solidcraft_dir: 'C:\Tools\solidcraft-0.8.0-windows-x64-portable'
 
 # Path of cadmpeg.exe. "make cadmpeg" installs it here.
 cadmpeg: '%LOCALAPPDATA%\f3z-to-solidcraft\cadmpeg\bin\cadmpeg.exe'
@@ -211,7 +217,7 @@ RESULT: NOT every part matches its original
 
 A part matches when its volume and bounding box equal those of the original solid.
 
-SolidCraft 0.6 and newer save the design as a zip container. SolidCraft 0.5 and older cannot open it, as a container or as JSON. Older builds still work with the converter: they write plain JSON under the same `.solidcraft` name. Designs saved as `.solvecraft` by earlier versions of the converter still open in every build.
+SolidCraft 0.6 and newer save the design as a zip container. SolidCraft 0.5 and older cannot open it, as a container or as JSON. Older builds still work with the converter: they write plain JSON under the same `.solidcraft` name. A design can be opened by the build that saved it and by newer ones, not by older ones: SolidCraft 0.7 and 0.8 each changed the format, so one saved through 0.8 does not open in 0.7 or 0.6. Designs saved as `.solvecraft` by earlier versions of the converter still open in every build.
 
 ## Logs
 

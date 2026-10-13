@@ -272,6 +272,9 @@ class Session:
             logger.debug("%s%s was refused: %s", command, "" if record else " (trial)", result)
         elif record:
             logger.debug("%s %s", command, params.get("name", ""))
+            # From 0.8 a feature that was built can still come with a warning.
+            if isinstance(result, dict) and result.get("warning"):
+                logger.warning("%s %s was built with a warning: %s", command, params.get("name", ""), result["warning"])
         return ok, result
 
     def undo(self) -> None:
