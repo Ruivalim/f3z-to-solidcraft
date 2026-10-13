@@ -152,6 +152,10 @@ class ConversionWorker(QThread):
         super().__init__(parent)
         self.options = options
         self.shown = SignalProgress(self.isInterruptionRequested, self)
+        # Where the tools are, once the run has read it; the window opens a saved design with it.
+        self.config: Config | None = None
+        # The designs the run has saved, in order.
+        self.saved: list[Path] = []
 
     def gather_sources(self) -> list[Path]:
         """
@@ -202,6 +206,7 @@ class ConversionWorker(QThread):
         text = report(parts)
         logger.info("Report for %s:\n%s", source.name, text)
         save_result(config, source, commands, text, design, self.options.also_open)
+        self.saved.append(design)
         if any(check(part) for part in parts):
             return MISMATCH, f"saved {design}; it does NOT match its original (see {design.with_suffix('.report.txt').name})"
         return CONVERTED, f"saved {design}; it matches its original"
@@ -248,7 +253,7 @@ class ConversionWorker(QThread):
         """
         logger.info("Window run started: %s", self.options)
         try:
-            config = load_config(self.options.config_path, self.options.overrides)
+            config = self.config = load_config(self.options.config_path, self.options.overrides)
             sources = self.gather_sources()
         except ConversionError as error:
             logger.error("Window run stopped: %s", error, exc_info=True)

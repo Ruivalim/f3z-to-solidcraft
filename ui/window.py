@@ -5,8 +5,8 @@ import logging
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QFontDatabase, QIcon, QPixmap
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices, QFontDatabase, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
     QMainWindow, QPlainTextEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
@@ -18,7 +18,7 @@ from ui.theme import apply_theme
 from ui.widgets import CollapsibleSection, DropZone, PathField, PulsingProgressBar, SkeletonList
 from utils.conversion_common import APP_NAME
 from utils.conversion_errors import ConversionError
-from utils.converter import PROJECT_DIR, config_path
+from utils.converter import PROJECT_DIR, config_path, open_design
 from utils.solvecraft_session import read_settings
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,9 @@ APP_USER_MODEL_ID = "f3z-to-solidcraft.converter"
 SOURCE_FILTER = "Fusion designs (*.f3z *.f3d)"
 # The source list grows with its rows up to this many, then scrolls.
 VISIBLE_SOURCES = 4
+# How spare height is shared out: a third to the upload section and two thirds to the run log. The
+# filler under them takes next to nothing beside those, and all of it once both are collapsed.
+UPLOAD_STRETCH, LOGS_STRETCH, FILLER_STRETCH = 100, 200, 1
 # How each file's outcome reads in the run log, and the status colour it gives the run.
 OUTCOME_STATES = {CONVERTED: "ok", MISMATCH: "warning", FAILED: "error", CANCELLED: "warning"}
 
@@ -69,8 +72,18 @@ class ConverterWindow(QMainWindow):
         self.run_done = False
         # The worst outcome of the run so far, for the status line's colour.
         self.run_state = "ok"
-        # The size the window opened at, gone back to when a run's log is cleared.
+        # True from the start of a run until its log, progress bar and footer are shown, which waits
+        # for the sections above them to close.
+        self.logs_pending = False
+        # The size the window opened at: the height it keeps to, growing past it only while what is showing needs more.
         self.start_size: QSize | None = None
+        # The height the showing widgets needed at the last fit; the window is fitted again when it changes.
+        self.fitted_height = 0
+        # One fit for however many layout changes arrive together, after the layout has caught up with them.
+        self.fit_timer = QTimer(self)
+        self.fit_timer.setSingleShot(True)
+        self.fit_timer.setInterval(0)
+        self.fit_timer.timeout.connect(self.fit_window)
 
         self.setWindowTitle(WINDOW_TITLE)
         self.setMinimumWidth(620)
@@ -93,9 +106,15 @@ class ConverterWindow(QMainWindow):
         self.build_options()
         self.build_run_area()
         self.build_footer()
-        # A collapsed section gives its height back, so the window does not keep the gap.
-        for section in (self.upload, self.output, self.advanced, self.logs):
-            section.toggle.toggled.connect(self.on_section_toggled)
+        # What a run adds is shown once these have closed; shown with them it would grow the window first and shrink it after.
+        for section in (self.upload, self.output):
+            section.settled.connect(self.show_pending_logs)
+        # The advanced options take the upload section's place while open, so the window stays near its size.
+        self.advanced.toggle.toggled.connect(self.on_advanced_toggled)
+        # Takes the height left over when every section is collapsed, so the rest stays at the top.
+        self.root.addStretch(FILLER_STRETCH)
+        # Whatever is shown, hidden, collapsed or resized asks the central widget for a new layout.
+        central.installEventFilter(self)
 
     def build_header(self) -> None:
         """
@@ -132,7 +151,7 @@ class ConverterWindow(QMainWindow):
         self.upload = CollapsibleSection("Upload")
         self.upload.set_content_layout(layout, indent=0)
         self.upload.set_expanded(True)
-        self.root.addWidget(self.upload, 1)
+        self.root.addWidget(self.upload, UPLOAD_STRETCH)
 
     def build_drop_zone(self, parent: QVBoxLayout) -> None:
         """
@@ -238,8 +257,8 @@ class ConverterWindow(QMainWindow):
 
     def build_run_area(self) -> None:
         """
-        Add the result banner, the Convert button, the progress bar, the status line,
-        and the run log in a collapsed Logs section.
+        Add the result banner, the Close and Convert buttons, the progress bar, the status line,
+        and the run log in a Logs section.
         """
         self.build_result_banner()
         row = QHBoxLayout()
@@ -250,7 +269,14 @@ class ConverterWindow(QMainWindow):
         self.convert_btn = QPushButton("Convert")
         self.convert_btn.setObjectName("ConvertBtn")
         self.convert_btn.clicked.connect(self.on_convert_clicked)
+        # Beside the button while it reads Clear: a finished run is either cleared for another or the last one.
+        self.close_btn = QPushButton("Close")
+        self.close_btn.setObjectName("CloseBtn")
+        self.close_btn.setToolTip("Close the converter")
+        self.close_btn.clicked.connect(self.close)
+        self.close_btn.setVisible(False)
         row.addWidget(self.status_label, 1)
+        row.addWidget(self.close_btn)
         row.addWidget(self.convert_btn)
         self.root.addLayout(row)
 
@@ -276,30 +302,102 @@ class ConverterWindow(QMainWindow):
         self.run_log.setMinimumHeight(170)
         layout = QVBoxLayout()
         layout.addWidget(self.run_log)
-        # Shown from the start of a run until it is cleared; collapsed unless opened.
+        # Shown from the start of a run until it is cleared; open unless collapsed.
         self.logs = CollapsibleSection("Logs")
         self.logs.set_content_layout(layout, indent=0)
+        self.logs.set_expanded(True)
         self.logs.setVisible(False)
-        self.root.addWidget(self.logs, 2)
+        self.root.addWidget(self.logs, LOGS_STRETCH)
 
     def build_result_banner(self) -> None:
         """
-        Add the banner that says how a finished run went; hidden until one finishes.
+        Add the banner that says how a finished run went, with buttons to open the log file
+        and what was saved; hidden until a run finishes.
         """
         self.result_banner = QFrame()
         self.result_banner.setObjectName("ResultBanner")
-        layout = QVBoxLayout(self.result_banner)
+        layout = QHBoxLayout(self.result_banner)
         layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(2)
+        layout.setSpacing(8)
+        text = QVBoxLayout()
+        text.setSpacing(2)
         self.result_title = QLabel()
         self.result_title.setObjectName("ResultTitle")
         self.result_detail = QLabel()
         self.result_detail.setObjectName("ResultDetail")
         self.result_detail.setWordWrap(True)
-        layout.addWidget(self.result_title)
-        layout.addWidget(self.result_detail)
+        text.addWidget(self.result_title)
+        text.addWidget(self.result_detail)
+        layout.addLayout(text, 1)
+        self.open_log_btn = self.result_action("Open log", self.open_log)
+        self.open_log_btn.setToolTip("Open the log file, which has every step of the run and the report of each design")
+        # Reads Open design or Open folder, by how many designs the run saved.
+        self.open_saved_btn = self.result_action("Open design", self.open_saved)
+        layout.addWidget(self.open_log_btn, 0, Qt.AlignVCenter)
+        layout.addWidget(self.open_saved_btn, 0, Qt.AlignVCenter)
         self.result_banner.setVisible(False)
         self.root.addWidget(self.result_banner)
+
+    def result_action(self, text: str, action) -> QPushButton:
+        """
+        Make a button of the result banner.
+
+        Args:
+        - text: What the button reads.
+        - action: What a click on it calls.
+
+        Returns:
+        - The button, named so the theme styles it.
+        """
+        button = QPushButton(text)
+        button.setObjectName("ResultAction")
+        button.setCursor(Qt.PointingHandCursor)
+        button.clicked.connect(action)
+        return button
+
+    def saved_designs(self) -> list[Path]:
+        """
+        List the designs the last run saved.
+
+        Returns:
+        - The designs, in the order they were saved; empty before the first run.
+        """
+        return list(self.worker.saved) if self.worker is not None else []
+
+    def open_log(self) -> None:
+        """
+        Open the log file in the program the system uses for it.
+        """
+        self.open_path(self.log_path)
+
+    def open_saved(self) -> None:
+        """
+        Open what the last run saved: its one design in SolidCraft, or the folder of its first when it saved several.
+        """
+        designs = self.saved_designs()
+        if not designs:
+            return
+        if len(designs) > 1:
+            self.open_path(designs[0].parent)
+            return
+        try:
+            open_design(self.worker.config, designs[0])
+        except ConversionError as error:
+            logger.error("The saved design could not be opened: %s", error)
+            self.set_status(str(error), "error")
+
+    def open_path(self, path: Path) -> None:
+        """
+        Open a file or a folder with the system's own program for it, saying so when that fails.
+
+        Args:
+        - path: The file or folder.
+        """
+        if QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            logger.info("Opened %s", path)
+            return
+        logger.error("The system could not open %s", path)
+        self.set_status(f"Could not open {path}", "error")
 
     def show_result(self, state: str, title: str, detail: str) -> None:
         """
@@ -312,6 +410,10 @@ class ConverterWindow(QMainWindow):
         """
         self.result_title.setText(title)
         self.result_detail.setText(detail)
+        saved = len(self.saved_designs())
+        self.open_saved_btn.setVisible(saved > 0)
+        self.open_saved_btn.setText("Open design" if saved == 1 else "Open folder")
+        self.open_saved_btn.setToolTip("Open the saved design in SolidCraft" if saved == 1 else "Open the folder the first design was saved in")
         self.result_banner.setProperty("state", state)
         # A property change alone does not re-evaluate the style sheet.
         for widget in (self.result_banner, self.result_title):
@@ -487,6 +589,9 @@ class ConverterWindow(QMainWindow):
         self.source_panel.setVisible(has_sources or checking)
         self.fit_source_list()
         self.output.setVisible(has_sources)
+        if not has_sources:
+            # The advanced options go with the Output section; closing them brings the drop zone back.
+            self.advanced.set_expanded(False)
 
     def pending_rows(self) -> int:
         """
@@ -507,7 +612,7 @@ class ConverterWindow(QMainWindow):
 
     def refresh_run_controls(self, running: bool) -> None:
         """
-        Set the Convert button and the footer for whether a run is on.
+        Set the Convert and Close buttons and the footer for whether a run is on.
 
         Args:
         - running: Whether a conversion is under way.
@@ -522,11 +627,12 @@ class ConverterWindow(QMainWindow):
             # Converting waits for dropped items to be checked, so none is missed.
             self.convert_btn.setEnabled(self.run_done or (bool(self.sources) and not self.checks))
             self.convert_btn.setText("Clear" if self.run_done else "Convert")
+        self.close_btn.setVisible(self.run_done and not running)
         self.convert_btn.setProperty("mode", "cancel" if running else "")
         # A property change alone does not re-evaluate the style sheet.
         self.convert_btn.style().unpolish(self.convert_btn)
         self.convert_btn.style().polish(self.convert_btn)
-        self.footer.setVisible(running)
+        self.footer.setVisible(running and not self.logs_pending)
 
     def set_status(self, text: str, state: str = "") -> None:
         """
@@ -592,50 +698,64 @@ class ConverterWindow(QMainWindow):
         """
         logger.info("Run log cleared")
         self.run_done = False
+        self.logs_pending = False
         self.run_log.clear()
         self.logs.setVisible(False)
         self.result_banner.setVisible(False)
         self.set_status("")
+        # Closed since the run began; the advanced options keep its place if they are open.
+        self.upload.set_expanded(not self.advanced.toggle.isChecked())
         self.refresh_state()
-        # After the layout has caught up with the hidden log, so its minimum no longer counts it.
-        QTimer.singleShot(0, self.restore_start_size)
 
-    def on_section_toggled(self, expanded: bool) -> None:
+    def on_advanced_toggled(self, expanded: bool) -> None:
         """
-        Shrink the window to fit once a section collapses; an opened one grows it by itself.
+        Collapse the upload section while the advanced options are open, and open it again after.
+
+        During a run, and after it until its log is cleared, the upload section stays as the run set it.
 
         Args:
-        - expanded: Whether the section is now open.
+        - expanded: Whether the advanced options are now open.
         """
-        if not expanded:
-            # After the layout has caught up with the hidden content.
-            QTimer.singleShot(0, self.shrink_to_fit)
+        if not self.is_running() and not self.run_done:
+            self.upload.set_expanded(not expanded)
 
-    def shrink_to_fit(self) -> None:
+    def eventFilter(self, watched, event) -> bool:
         """
-        Take the window's height down to what is showing needs, keeping its width.
-        """
-        if self.isMaximized() or self.isFullScreen():
-            return
-        self.centralWidget().layout().activate()
-        self.layout().activate()
-        self.resize(self.width(), self.minimumSizeHint().height())
+        Ask for the window to be fitted whenever what the central widget shows changes.
 
-    def restore_start_size(self) -> None:
+        Args:
+        - watched: The widget the event is for.
+        - event: The event.
+
+        Returns:
+        - Whether the event stops here; a layout request never does.
         """
-        Go back to the size the window opened at; no smaller than what is now showing needs.
+        if watched is self.centralWidget() and event.type() == QEvent.LayoutRequest:
+            self.fit_timer.start()
+        return super().eventFilter(watched, event)
+
+    def fit_window(self) -> None:
+        """
+        Bring the window's height back to the one it opened at, or to what is showing needs when
+        that is more. Its width is kept, and so is a height set by hand until what is showing changes.
         """
         if self.start_size is None or self.isMaximized() or self.isFullScreen():
             return
-        logger.info("Window back to its starting size %dx%d", self.start_size.width(), self.start_size.height())
-        # The window's minimum size still counts the hidden log until its layout is redone.
+        # The window's minimum size still counts hidden widgets until its layouts are redone.
         self.centralWidget().layout().activate()
         self.layout().activate()
-        self.resize(self.start_size.expandedTo(self.minimumSizeHint()))
+        needed = self.minimumSizeHint().height()
+        if needed == self.fitted_height:
+            return
+        self.fitted_height = needed
+        height = max(self.start_size.height(), needed)
+        if height != self.height():
+            logger.debug("Window height %d to %d; what is showing needs %d", self.height(), height, needed)
+            self.resize(self.width(), height)
 
     def showEvent(self, event) -> None:
         """
-        Note the size the window first opens at.
+        Note the size the window first opens at, and what its widgets needed then.
 
         Args:
         - event: The show event.
@@ -643,6 +763,7 @@ class ConverterWindow(QMainWindow):
         super().showEvent(event)
         if self.start_size is None:
             self.start_size = self.size()
+            self.fitted_height = self.minimumSizeHint().height()
 
     def start_conversion(self) -> None:
         """
@@ -652,16 +773,15 @@ class ConverterWindow(QMainWindow):
             return
         self.run_state = "ok"
         self.cancel_requested = False
-        # Keep the window short during the run: what was dropped and the advanced options are not needed.
+        # What was dropped and the options are not needed during the run; collapsed, they leave the room to the log.
         self.advanced.set_expanded(False)
         self.upload.set_expanded(False)
         self.output.set_expanded(False)
         self.run_log.clear()
-        self.logs.setVisible(True)
         self.result_banner.setVisible(False)
+        self.logs_pending = True
         self.file_number, self.file_total = 0, 0
         self.on_progressed(0, 0)
-        self.progress_row.setVisible(True)
         self.set_status("Starting")
 
         self.worker = ConversionWorker(self.collect_options(), self)
@@ -676,6 +796,21 @@ class ConverterWindow(QMainWindow):
         self.worker.shown.step_finished.connect(self.on_step_finished)
         self.worker.start()
         self.refresh_state()
+        # At once when both sections were closed already.
+        self.show_pending_logs()
+
+    def show_pending_logs(self) -> None:
+        """
+        Show the progress bar and the footer and slide the run log in, once a run has started
+        and the sections above them have closed.
+        """
+        if not self.logs_pending or self.upload.is_sliding() or self.output.is_sliding():
+            return
+        self.logs_pending = False
+        running = self.is_running()
+        self.progress_row.setVisible(running)
+        self.footer.setVisible(running)
+        self.logs.slide_in()
 
     def on_file_started(self, number: int, total: int, source: str) -> None:
         """
@@ -767,9 +902,9 @@ class ConverterWindow(QMainWindow):
         if state == "ok":
             self.show_result("ok", "Conversion complete", f"{saved} of {total} {designs} saved, matching the original.")
         elif state == "warning":
-            self.show_result("warning", "Saved with differences", f"{saved} of {total} {designs} saved; open Logs to see what differs.")
+            self.show_result("warning", "Saved with differences", f"{saved} of {total} {designs} saved; the log says what differs.")
         else:
-            self.show_result("error", "Not everything was converted", f"{saved} of {total} {designs} saved; open Logs to see why.")
+            self.show_result("error", "Not everything was converted", f"{saved} of {total} {designs} saved; the log says why.")
         self.run_log.appendPlainText(f"Done: {saved} of {total} saved. Details in {self.log_path}")
         self.sources.clear()
         self.source_list.clear()
@@ -779,11 +914,12 @@ class ConverterWindow(QMainWindow):
         Put the window back in its waiting state, or close it if that was asked for during the run.
         """
         self.progress_row.setVisible(False)
-        # The run is over: the drop zone and the options are back for the next one.
-        self.upload.set_expanded(True)
+        # A finished run keeps the upload section closed until its log is cleared. A run that could not
+        # start has nothing to clear, so the section is back at once, unless the advanced options
+        # opened in its place to explain why.
+        if not self.run_done:
+            self.upload.set_expanded(not self.advanced.toggle.isChecked())
         self.output.set_expanded(True)
-        # Without its sources the drop zone is back to its starting size; the window follows it down.
-        QTimer.singleShot(0, self.shrink_to_fit)
         self.refresh_state()
         if self.close_pending:
             self.close()

@@ -179,6 +179,9 @@ QFrame#ResultBanner[state="warning"] QLabel#ResultTitle {{
 QFrame#ResultBanner[state="error"] QLabel#ResultTitle {{
     color: {c['danger']};
 }}
+QPushButton#ResultAction {{
+    padding: 4px 12px;
+}}
 QLabel#ProgressLabel {{
     color: {c['text_muted']};
     min-width: 36px;
@@ -256,6 +259,9 @@ QPushButton:pressed {{
 }}
 QPushButton:disabled {{
     color: {c['text_muted']};
+}}
+QPushButton#CloseBtn {{
+    padding: 8px 28px;
 }}
 QPushButton#ConvertBtn {{
     background-color: {c['accent']};
