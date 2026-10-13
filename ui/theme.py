@@ -149,6 +149,40 @@ QLabel#AppTitle {{
 QLabel#AppSubtitle {{
     color: {c['text_muted']};
 }}
+QLabel#Footer {{
+    color: {c['text_muted']};
+}}
+QFrame#ResultBanner {{
+    border-radius: 8px;
+}}
+QFrame#ResultBanner[state="ok"] {{
+    background-color: {translucent(c['success'], 0.12)};
+    border: 1px solid {c['success']};
+}}
+QFrame#ResultBanner[state="warning"] {{
+    background-color: {translucent(c['warning'], 0.12)};
+    border: 1px solid {c['warning']};
+}}
+QFrame#ResultBanner[state="error"] {{
+    background-color: {translucent(c['danger'], 0.12)};
+    border: 1px solid {c['danger']};
+}}
+QLabel#ResultTitle {{
+    font-weight: 600;
+}}
+QFrame#ResultBanner[state="ok"] QLabel#ResultTitle {{
+    color: {c['success']};
+}}
+QFrame#ResultBanner[state="warning"] QLabel#ResultTitle {{
+    color: {c['warning']};
+}}
+QFrame#ResultBanner[state="error"] QLabel#ResultTitle {{
+    color: {c['danger']};
+}}
+QLabel#ProgressLabel {{
+    color: {c['text_muted']};
+    min-width: 36px;
+}}
 
 /* Drop zone */
 QFrame#DropZone {{
@@ -232,6 +266,11 @@ QPushButton#ConvertBtn {{
 }}
 QPushButton#ConvertBtn:hover {{
     border-color: {c['text']};
+}}
+QPushButton#ConvertBtn[mode="cancel"] {{
+    background-color: {c['input']};
+    color: {c['danger']};
+    border-color: {c['danger']};
 }}
 QPushButton#ConvertBtn:disabled {{
     background-color: {c['border']};

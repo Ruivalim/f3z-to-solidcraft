@@ -284,19 +284,24 @@ def rebuild(config: Config, parts: list[Part], work: Path, shown: Progress) -> S
     """
     session = Session(config.cli)
     components: list[Design] = []
-    for part in parts:
-        design = part.design
-        part.outcomes, part.result = [], None
-        if design.linked:
-            session.execute("component.create", {"name": design.name})
-            components.append(design)
-        builder = Builder(session, part, work, [] if design.linked else components, shown)
-        if part.route == "history":
-            builder.run()
-        else:
-            insert_original(session, builder, part, shown)
-        if design.linked:
-            session.execute("component.activate", {"component": "root"})
+    try:
+        for part in parts:
+            design = part.design
+            part.outcomes, part.result = [], None
+            if design.linked:
+                session.execute("component.create", {"name": design.name})
+                components.append(design)
+            builder = Builder(session, part, work, [] if design.linked else components, shown)
+            if part.route == "history":
+                builder.run()
+            else:
+                insert_original(session, builder, part, shown)
+            if design.linked:
+                session.execute("component.activate", {"component": "root"})
+    except BaseException:
+        # Failed or cancelled part way: SolidCraft is not left running.
+        session.close()
+        raise
     return session
 
 

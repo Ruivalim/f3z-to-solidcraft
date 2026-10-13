@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLayout, QToolButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLayout, QSizePolicy, QToolButton, QVBoxLayout, QWidget
 
 
 class CollapsibleSection(QWidget):
@@ -35,15 +35,17 @@ class CollapsibleSection(QWidget):
         layout.setSpacing(6)
         layout.addWidget(self.toggle)
         layout.addWidget(self.content)
+        self.set_expanded(False)
 
-    def set_content_layout(self, layout: QLayout) -> None:
+    def set_content_layout(self, layout: QLayout, indent: int = 18) -> None:
         """
         Give the section what it shows when open.
 
         Args:
         - layout: The layout holding the section's widgets.
+        - indent: How far the content sits in from the title, in pixels.
         """
-        layout.setContentsMargins(18, 0, 0, 0)
+        layout.setContentsMargins(indent, 0, 0, 0)
         self.content.setLayout(layout)
 
     def set_expanded(self, expanded: bool) -> None:
@@ -56,3 +58,5 @@ class CollapsibleSection(QWidget):
         self.toggle.setChecked(expanded)
         self.toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
         self.content.setVisible(expanded)
+        # Collapsed, the section keeps to its title and leaves spare height to the rest.
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred if expanded else QSizePolicy.Maximum)

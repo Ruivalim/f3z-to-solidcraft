@@ -5,19 +5,20 @@ import logging
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QFontDatabase, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
-    QListWidget, QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
+    QMainWindow, QPlainTextEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from ui.conversion_worker import CONVERTED, FAILED, MISMATCH, ConversionOptions, ConversionWorker
+from ui.conversion_worker import CANCELLED, CONVERTED, FAILED, MISMATCH, ConversionOptions, ConversionWorker
+from ui.source_check_worker import SourceCheckWorker
 from ui.theme import apply_theme
-from ui.widgets import CollapsibleSection, DropZone, PathField
+from ui.widgets import CollapsibleSection, DropZone, PathField, PulsingProgressBar, SkeletonList
 from utils.conversion_common import APP_NAME
 from utils.conversion_errors import ConversionError
-from utils.converter import PROJECT_DIR, SOURCE_SUFFIXES, config_path
+from utils.converter import PROJECT_DIR, config_path
 from utils.solvecraft_session import read_settings
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ SOURCE_FILTER = "Fusion designs (*.f3z *.f3d)"
 # The source list grows with its rows up to this many, then scrolls.
 VISIBLE_SOURCES = 4
 # How each file's outcome reads in the run log, and the status colour it gives the run.
-OUTCOME_STATES = {CONVERTED: "ok", MISMATCH: "warning", FAILED: "error"}
+OUTCOME_STATES = {CONVERTED: "ok", MISMATCH: "warning", FAILED: "error", CANCELLED: "warning"}
 
 
 class ConverterWindow(QMainWindow):
@@ -57,11 +58,19 @@ class ConverterWindow(QMainWindow):
         self.log_path = log_path
         self.sources: list[Path] = []
         self.worker: ConversionWorker | None = None
+        # Checks of dropped items still running; each adds its sources when done.
+        self.checks: list[SourceCheckWorker] = []
         self.close_pending = False
+        # True from a cancel until the next run; the worker's own flag is gone once its thread ends.
+        self.cancel_requested = False
+        # The file being converted and how many the run has, for the progress label.
+        self.file_number = self.file_total = 0
         # True from the end of a run until its log is cleared; the button then reads Clear.
         self.run_done = False
         # The worst outcome of the run so far, for the status line's colour.
         self.run_state = "ok"
+        # The size the window opened at, gone back to when a run's log is cleared.
+        self.start_size: QSize | None = None
 
         self.setWindowTitle(WINDOW_TITLE)
         self.setMinimumWidth(620)
@@ -71,7 +80,7 @@ class ConverterWindow(QMainWindow):
 
     def build_ui(self) -> None:
         """
-        Lay out the window: drop zone, sources, options, then the run area.
+        Lay out the window: the upload section, options, then the run area.
         """
         central = QWidget()
         central.setObjectName("CentralWidget")
@@ -80,10 +89,13 @@ class ConverterWindow(QMainWindow):
         self.root.setContentsMargins(18, 18, 18, 18)
         self.root.setSpacing(12)
         self.build_header()
-        self.build_drop_zone()
-        self.build_source_list()
+        self.build_upload()
         self.build_options()
         self.build_run_area()
+        self.build_footer()
+        # A collapsed section gives its height back, so the window does not keep the gap.
+        for section in (self.upload, self.output, self.advanced, self.logs):
+            section.toggle.toggled.connect(self.on_section_toggled)
 
     def build_header(self) -> None:
         """
@@ -109,25 +121,45 @@ class ConverterWindow(QMainWindow):
         header.addLayout(text, 1)
         self.root.addLayout(header)
 
-    def build_drop_zone(self) -> None:
+    def build_upload(self) -> None:
+        """
+        Add the Upload section: the drop zone and the source list, collapsed while a run is on.
+        """
+        layout = QVBoxLayout()
+        layout.setSpacing(12)
+        self.build_drop_zone(layout)
+        self.build_source_list(layout)
+        self.upload = CollapsibleSection("Upload")
+        self.upload.set_content_layout(layout, indent=0)
+        self.upload.set_expanded(True)
+        self.root.addWidget(self.upload, 1)
+
+    def build_drop_zone(self, parent: QVBoxLayout) -> None:
         """
         Add the area sources are dropped on.
+
+        Args:
+        - parent: The layout it goes in.
         """
         self.drop_zone = DropZone("Drop Fusion files or folders here", "")
         self.drop_zone.paths_dropped.connect(self.add_paths)
         self.drop_zone.clicked.connect(self.choose_files)
-        self.root.addWidget(self.drop_zone, 1)
+        parent.addWidget(self.drop_zone, 1)
 
-    def build_source_list(self) -> None:
+    def build_source_list(self, parent: QVBoxLayout) -> None:
         """
         Add the list of what was dropped, with its buttons.
+
+        Args:
+        - parent: The layout it goes in.
         """
         self.source_panel = QWidget()
         layout = QVBoxLayout(self.source_panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        self.source_list = QListWidget()
+        # Items being checked show as pulsing rows below the listed ones.
+        self.source_list = SkeletonList()
         self.source_list.setObjectName("SourceList")
         # Long paths are shortened in the middle, keeping the drive and the file name in view.
         self.source_list.setTextElideMode(Qt.ElideMiddle)
@@ -144,11 +176,12 @@ class ConverterWindow(QMainWindow):
         buttons.addStretch(1)
         buttons.addWidget(self.clear_btn)
         layout.addLayout(buttons)
-        self.root.addWidget(self.source_panel)
+        parent.addWidget(self.source_panel)
 
     def build_options(self) -> None:
         """
-        Add the export options, shown once there is something to convert.
+        Add the export options in an Output section, shown once there is something to convert
+        and collapsed while a run is on.
         """
         self.options_card = QFrame()
         self.options_card.setObjectName("OptionsCard")
@@ -169,7 +202,12 @@ class ConverterWindow(QMainWindow):
         self.open_check = QCheckBox("Open each design in SolidCraft when it is saved")
         layout.addWidget(self.open_check)
         layout.addWidget(self.build_advanced())
-        self.root.addWidget(self.options_card)
+        section = QVBoxLayout()
+        section.addWidget(self.options_card)
+        self.output = CollapsibleSection("Output")
+        self.output.set_content_layout(section, indent=0)
+        self.output.set_expanded(True)
+        self.root.addWidget(self.output)
 
     def build_advanced(self) -> CollapsibleSection:
         """
@@ -200,8 +238,10 @@ class ConverterWindow(QMainWindow):
 
     def build_run_area(self) -> None:
         """
-        Add the Convert button, the progress bar, the status line and the run log.
+        Add the result banner, the Convert button, the progress bar, the status line,
+        and the run log in a collapsed Logs section.
         """
+        self.build_result_banner()
         row = QHBoxLayout()
         row.setSpacing(12)
         self.status_label = QLabel()
@@ -214,10 +254,19 @@ class ConverterWindow(QMainWindow):
         row.addWidget(self.convert_btn)
         self.root.addLayout(row)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setVisible(False)
-        self.root.addWidget(self.progress_bar)
+        # Pulses the step under way, so a step taking minutes still shows the run is alive.
+        self.progress_bar = PulsingProgressBar()
+        self.progress_label = QLabel()
+        self.progress_label.setObjectName("ProgressLabel")
+        self.progress_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.progress_row = QWidget()
+        progress = QHBoxLayout(self.progress_row)
+        progress.setContentsMargins(0, 0, 0, 0)
+        progress.setSpacing(10)
+        progress.addWidget(self.progress_bar, 1)
+        progress.addWidget(self.progress_label)
+        self.progress_row.setVisible(False)
+        self.root.addWidget(self.progress_row)
 
         self.run_log = QPlainTextEdit()
         self.run_log.setObjectName("RunLog")
@@ -225,8 +274,60 @@ class ConverterWindow(QMainWindow):
         self.run_log.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.run_log.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
         self.run_log.setMinimumHeight(170)
-        self.run_log.setVisible(False)
-        self.root.addWidget(self.run_log, 2)
+        layout = QVBoxLayout()
+        layout.addWidget(self.run_log)
+        # Shown from the start of a run until it is cleared; collapsed unless opened.
+        self.logs = CollapsibleSection("Logs")
+        self.logs.set_content_layout(layout, indent=0)
+        self.logs.setVisible(False)
+        self.root.addWidget(self.logs, 2)
+
+    def build_result_banner(self) -> None:
+        """
+        Add the banner that says how a finished run went; hidden until one finishes.
+        """
+        self.result_banner = QFrame()
+        self.result_banner.setObjectName("ResultBanner")
+        layout = QVBoxLayout(self.result_banner)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(2)
+        self.result_title = QLabel()
+        self.result_title.setObjectName("ResultTitle")
+        self.result_detail = QLabel()
+        self.result_detail.setObjectName("ResultDetail")
+        self.result_detail.setWordWrap(True)
+        layout.addWidget(self.result_title)
+        layout.addWidget(self.result_detail)
+        self.result_banner.setVisible(False)
+        self.root.addWidget(self.result_banner)
+
+    def show_result(self, state: str, title: str, detail: str) -> None:
+        """
+        Show how the run went in the banner, coloured by its outcome.
+
+        Args:
+        - state: ``ok``, ``warning`` or ``error``.
+        - title: A few words: the outcome.
+        - detail: A sentence about it.
+        """
+        self.result_title.setText(title)
+        self.result_detail.setText(detail)
+        self.result_banner.setProperty("state", state)
+        # A property change alone does not re-evaluate the style sheet.
+        for widget in (self.result_banner, self.result_title):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+        self.result_banner.setVisible(True)
+
+    def build_footer(self) -> None:
+        """
+        Add the line under the run log asking for patience, shown only while a run is on.
+        """
+        self.footer = QLabel("This can take a while, please be patient.")
+        self.footer.setObjectName("Footer")
+        self.footer.setAlignment(Qt.AlignCenter)
+        self.footer.setVisible(False)
+        self.root.addWidget(self.footer)
 
     def field_label(self, text: str) -> QLabel:
         """
@@ -277,21 +378,35 @@ class ConverterWindow(QMainWindow):
 
     def add_paths(self, paths: list[Path]) -> None:
         """
-        Add dropped or chosen items to the sources, leaving out what cannot be converted.
+        Check dropped or chosen items on a worker thread; what can be converted is added when it is done.
 
         Args:
         - paths: Files and folders.
         """
-        usable = [path for path in paths if path.is_dir() or (path.is_file() and path.suffix.lower() in SOURCE_SUFFIXES)]
-        ignored = len(paths) - len(usable)
+        check = SourceCheckWorker(paths, self)
+        check.checked.connect(self.on_sources_checked)
+        check.finished.connect(self.on_check_finished)
+        self.checks.append(check)
+        self.set_status(f"Checking {len(paths)} item(s)")
+        check.start()
+        self.refresh_state()
+
+    def on_sources_checked(self, usable: list[tuple[Path, bool]], ignored: int) -> None:
+        """
+        Add checked items to the sources.
+
+        Args:
+        - usable: The items that can be converted, each with whether it is a folder.
+        - ignored: How many items were left out.
+        """
         if usable and self.run_done:
             # Something new starts over: the last run's log makes way for the next.
             self.reset_run()
-        for path in usable:
+        for path, is_folder in usable:
             if path not in self.sources:
                 self.sources.append(path)
-                self.source_list.addItem(f"{path}\\" if path.is_dir() else str(path))
-        logger.info("Sources now %d; ignored %d of %d added", len(self.sources), ignored, len(paths))
+                self.source_list.addItem(f"{path}\\" if is_folder else str(path))
+        logger.info("Sources now %d; ignored %d of %d added", len(self.sources), ignored, len(usable) + ignored)
         if ignored:
             self.set_status(f"Ignored {ignored} item(s) that are not .f3z or .f3d files or folders", "warning")
         else:
@@ -332,24 +447,86 @@ class ConverterWindow(QMainWindow):
         """
         return self.worker is not None and self.worker.isRunning()
 
+    def on_check_finished(self) -> None:
+        """
+        Forget a finished check, and close the window if that was asked for while it ran.
+        """
+        check = self.sender()
+        if check in self.checks:
+            self.checks.remove(check)
+            check.deleteLater()
+        self.refresh_state()
+        if self.close_pending and not self.checks:
+            self.close()
+
     def refresh_state(self) -> None:
         """
         Show, hide and enable the widgets to suit what there is to convert and whether a run is on.
         """
-        has_sources, running = bool(self.sources), self.is_running()
-        count = len(self.sources)
-        self.drop_zone.set_compact(has_sources)
-        self.drop_zone.title.setText(f"{count} item(s) to convert" if has_sources else "Drop Fusion files or folders here")
-        self.drop_zone.hint.setText("Drop more, or click to choose files" if has_sources else ".f3z and .f3d, or click to choose files")
-        self.source_panel.setVisible(has_sources)
-        rows = min(count, VISIBLE_SOURCES)
-        self.source_list.setFixedHeight(rows * max(self.source_list.sizeHintForRow(0), 0) + 2 * self.source_list.frameWidth() + 4)
-        self.options_card.setVisible(has_sources)
-        # After a run the button clears its log; otherwise it converts what is listed.
-        self.convert_btn.setEnabled(not running and (has_sources or self.run_done))
-        self.convert_btn.setText("Converting" if running else "Clear" if self.run_done else "Convert")
-        for widget in (self.drop_zone, self.source_panel, self.options_card):
+        running = self.is_running()
+        self.refresh_sources()
+        self.refresh_run_controls(running)
+        # The run has read its options already, so they are locked; the Advanced
+        # section still opens and closes to show what the run is using.
+        for widget in (self.drop_zone, self.source_panel, self.output_field, self.open_check, self.advanced.content):
             widget.setEnabled(not running)
+
+    def refresh_sources(self) -> None:
+        """
+        Fit the drop zone, the source list and the options to what is listed and what is being checked.
+        """
+        has_sources, checking = bool(self.sources), bool(self.checks)
+        self.source_list.set_skeleton_rows(self.pending_rows())
+        self.drop_zone.set_compact(has_sources or checking)
+        if has_sources:
+            self.drop_zone.title.setText(f"{len(self.sources)} item(s) to convert")
+            self.drop_zone.hint.setText("Drop more, or click to choose files")
+        else:
+            self.drop_zone.title.setText("Drop Fusion files or folders here")
+            self.drop_zone.hint.setText(".f3z and .f3d, or click to choose files")
+        self.source_panel.setVisible(has_sources or checking)
+        self.fit_source_list()
+        self.output.setVisible(has_sources)
+
+    def pending_rows(self) -> int:
+        """
+        Count the placeholder rows to show for items still being checked.
+
+        Returns:
+        - One per item being checked, no more than the list shows at once.
+        """
+        return min(sum(len(check.paths) for check in self.checks), VISIBLE_SOURCES)
+
+    def fit_source_list(self) -> None:
+        """
+        Size the source list to its rows, up to VISIBLE_SOURCES; past that it scrolls.
+        """
+        rows = min(self.source_list.count(), VISIBLE_SOURCES)
+        row_height = max(self.source_list.sizeHintForRow(0), 0)
+        self.source_list.setFixedHeight(rows * row_height + 2 * self.source_list.frameWidth() + 4)
+
+    def refresh_run_controls(self, running: bool) -> None:
+        """
+        Set the Convert button and the footer for whether a run is on.
+
+        Args:
+        - running: Whether a conversion is under way.
+        """
+        if running:
+            # During a run the button cancels it, once.
+            cancelling = self.cancel_requested
+            self.convert_btn.setEnabled(not cancelling)
+            self.convert_btn.setText("Cancelling" if cancelling else "Cancel")
+        else:
+            # After a run the button clears its log; otherwise it converts what is listed.
+            # Converting waits for dropped items to be checked, so none is missed.
+            self.convert_btn.setEnabled(self.run_done or (bool(self.sources) and not self.checks))
+            self.convert_btn.setText("Clear" if self.run_done else "Convert")
+        self.convert_btn.setProperty("mode", "cancel" if running else "")
+        # A property change alone does not re-evaluate the style sheet.
+        self.convert_btn.style().unpolish(self.convert_btn)
+        self.convert_btn.style().polish(self.convert_btn)
+        self.footer.setVisible(running)
 
     def set_status(self, text: str, state: str = "") -> None:
         """
@@ -388,12 +565,26 @@ class ConverterWindow(QMainWindow):
 
     def on_convert_clicked(self) -> None:
         """
-        Do what the button reads: clear the finished run, or convert what is listed.
+        Do what the button reads: cancel the run, clear the finished one, or convert what is listed.
         """
-        if self.run_done:
+        if self.is_running():
+            self.cancel_conversion()
+        elif self.run_done:
             self.reset_run()
         else:
             self.start_conversion()
+
+    def cancel_conversion(self) -> None:
+        """
+        Ask the run to stop at the end of the step under way; nothing of the file being converted is saved.
+        """
+        if not self.is_running() or self.cancel_requested:
+            return
+        logger.info("Cancel asked for")
+        self.cancel_requested = True
+        self.worker.requestInterruption()
+        self.set_status("Cancelling after the current step", "warning")
+        self.refresh_state()
 
     def reset_run(self) -> None:
         """
@@ -402,21 +593,75 @@ class ConverterWindow(QMainWindow):
         logger.info("Run log cleared")
         self.run_done = False
         self.run_log.clear()
-        self.run_log.setVisible(False)
+        self.logs.setVisible(False)
+        self.result_banner.setVisible(False)
         self.set_status("")
         self.refresh_state()
+        # After the layout has caught up with the hidden log, so its minimum no longer counts it.
+        QTimer.singleShot(0, self.restore_start_size)
+
+    def on_section_toggled(self, expanded: bool) -> None:
+        """
+        Shrink the window to fit once a section collapses; an opened one grows it by itself.
+
+        Args:
+        - expanded: Whether the section is now open.
+        """
+        if not expanded:
+            # After the layout has caught up with the hidden content.
+            QTimer.singleShot(0, self.shrink_to_fit)
+
+    def shrink_to_fit(self) -> None:
+        """
+        Take the window's height down to what is showing needs, keeping its width.
+        """
+        if self.isMaximized() or self.isFullScreen():
+            return
+        self.centralWidget().layout().activate()
+        self.layout().activate()
+        self.resize(self.width(), self.minimumSizeHint().height())
+
+    def restore_start_size(self) -> None:
+        """
+        Go back to the size the window opened at; no smaller than what is now showing needs.
+        """
+        if self.start_size is None or self.isMaximized() or self.isFullScreen():
+            return
+        logger.info("Window back to its starting size %dx%d", self.start_size.width(), self.start_size.height())
+        # The window's minimum size still counts the hidden log until its layout is redone.
+        self.centralWidget().layout().activate()
+        self.layout().activate()
+        self.resize(self.start_size.expandedTo(self.minimumSizeHint()))
+
+    def showEvent(self, event) -> None:
+        """
+        Note the size the window first opens at.
+
+        Args:
+        - event: The show event.
+        """
+        super().showEvent(event)
+        if self.start_size is None:
+            self.start_size = self.size()
 
     def start_conversion(self) -> None:
         """
         Start converting the sources on a worker thread.
         """
-        if self.is_running() or not self.sources:
+        if self.is_running() or self.checks or not self.sources:
             return
         self.run_state = "ok"
+        self.cancel_requested = False
+        # Keep the window short during the run: what was dropped and the advanced options are not needed.
+        self.advanced.set_expanded(False)
+        self.upload.set_expanded(False)
+        self.output.set_expanded(False)
         self.run_log.clear()
-        self.run_log.setVisible(True)
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setVisible(True)
+        self.logs.setVisible(True)
+        self.result_banner.setVisible(False)
+        self.file_number, self.file_total = 0, 0
+        self.on_progressed(0, 0)
+        self.progress_row.setVisible(True)
         self.set_status("Starting")
 
         self.worker = ConversionWorker(self.collect_options(), self)
@@ -442,11 +687,15 @@ class ConverterWindow(QMainWindow):
         - source: The file.
         """
         self.run_log.appendPlainText(f"[{number}/{total}] {source}")
-        self.progress_bar.setRange(0, 0)
+        self.file_number, self.file_total = number, total
+        self.on_progressed(0, 0)
 
     def on_progressed(self, done: int, total: int) -> None:
         """
-        Move the progress bar.
+        Move the progress bar and its percentage, led by the file's place when the run has several.
+
+        The total grows as the file's documents are read, so early on the
+        percentage can drop back.
 
         Args:
         - done: Steps finished in the current file.
@@ -454,6 +703,9 @@ class ConverterWindow(QMainWindow):
         """
         self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(done)
+        percent = f"{100 * done // total}%" if total else "…"
+        place = f"{self.file_number}/{self.file_total} · " if self.file_total > 1 else ""
+        self.progress_label.setText(place + percent)
 
     def on_step_finished(self, what: str, status: str) -> None:
         """
@@ -492,7 +744,7 @@ class ConverterWindow(QMainWindow):
 
     def on_all_finished(self, saved: int, total: int) -> None:
         """
-        Sum the run up in the status line and empty the source list, leaving the run log to read.
+        Sum the run up in the result banner and empty the source list, leaving the run log to read.
 
         The worker sends this once, after the last file of the last folder, so
         the entries stay listed for the whole run. A run that could not start
@@ -502,36 +754,60 @@ class ConverterWindow(QMainWindow):
         - saved: How many designs were saved.
         - total: How many files the run had.
         """
+        self.run_done = True
+        # The banner says it now; the status line would only repeat it.
+        self.set_status("")
+        designs = "design" if total == 1 else "designs"
+        if self.cancel_requested:
+            # The sources stay listed, so the run can be started again.
+            self.show_result("warning", "Conversion cancelled", f"{saved} of {total} {designs} saved before the cancel.")
+            self.run_log.appendPlainText(f"Cancelled: {saved} of {total} saved. Details in {self.log_path}")
+            return
         state = self.run_state if saved == total else "error"
-        self.set_status(f"{saved} of {total} saved", state)
+        if state == "ok":
+            self.show_result("ok", "Conversion complete", f"{saved} of {total} {designs} saved, matching the original.")
+        elif state == "warning":
+            self.show_result("warning", "Saved with differences", f"{saved} of {total} {designs} saved; open Logs to see what differs.")
+        else:
+            self.show_result("error", "Not everything was converted", f"{saved} of {total} {designs} saved; open Logs to see why.")
         self.run_log.appendPlainText(f"Done: {saved} of {total} saved. Details in {self.log_path}")
         self.sources.clear()
         self.source_list.clear()
-        self.run_done = True
 
     def on_thread_finished(self) -> None:
         """
         Put the window back in its waiting state, or close it if that was asked for during the run.
         """
-        self.progress_bar.setVisible(False)
+        self.progress_row.setVisible(False)
+        # The run is over: the drop zone and the options are back for the next one.
+        self.upload.set_expanded(True)
+        self.output.set_expanded(True)
+        # Without its sources the drop zone is back to its starting size; the window follows it down.
+        QTimer.singleShot(0, self.shrink_to_fit)
         self.refresh_state()
         if self.close_pending:
             self.close()
 
     def closeEvent(self, event) -> None:
         """
-        Hold the window open until the file being converted is done, so SolidCraft is not left running.
+        Cancel a run and hold the window open until it stops, so SolidCraft is not left running,
+        and until dropped items are checked, as a thread cannot be destroyed while it runs.
 
         Args:
         - event: The close event.
         """
-        if not self.is_running():
+        if not self.is_running() and not self.checks:
             event.accept()
             return
-        logger.info("Close asked for during a run; finishing the current file first")
+        if not self.is_running():
+            logger.info("Close asked for while dropped items are checked; closing when that is done")
+            self.close_pending = True
+            event.ignore()
+            return
+        logger.info("Close asked for during a run; cancelling it first")
         self.close_pending = True
-        self.worker.requestInterruption()
-        self.setWindowTitle(f"{WINDOW_TITLE} (closing after the current file)")
+        self.cancel_conversion()
+        self.setWindowTitle(f"{WINDOW_TITLE} (closing after the current step)")
         event.ignore()
 
 

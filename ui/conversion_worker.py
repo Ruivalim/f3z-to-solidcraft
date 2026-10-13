@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
 from utils.conversion_common import DESIGN_SUFFIX
-from utils.conversion_errors import ConversionError
+from utils.conversion_errors import ConversionCancelled, ConversionError
 from utils.converter import check, convert, find_sources, make_work_folder, report, save_result
 from utils.solvecraft_session import Config, load_config
 
 logger = logging.getLogger(__name__)
 
 # What became of one source file.
-CONVERTED, MISMATCH, NOT_SAVED, FAILED = "converted", "mismatch", "not saved", "failed"
+CONVERTED, MISMATCH, NOT_SAVED, FAILED, CANCELLED = "converted", "mismatch", "not saved", "failed", "cancelled"
 
 
 @dataclass
@@ -39,23 +40,36 @@ class SignalProgress(QObject):
     The converter's progress display, sending each change to the window as a signal.
 
     It has the methods of the terminal's Progress, so the converter drives
-    either without knowing which.
+    either without knowing which. As the converter calls it between steps,
+    it is also where a cancel takes effect.
     """
 
     progressed = Signal(int, int)
     step_started = Signal(str)
     step_finished = Signal(str, str)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, cancelled: Callable[[], bool], parent=None) -> None:
         """
         Set up the counters.
 
         Args:
+        - cancelled: Tells whether the run has been cancelled.
         - parent: The parent object.
         """
         super().__init__(parent)
+        self.cancelled = cancelled
         self.done = 0
         self.total = 0
+
+    def stop_if_cancelled(self) -> None:
+        """
+        End the conversion here if it has been cancelled.
+
+        Raises:
+        - ConversionCancelled: If it has.
+        """
+        if self.cancelled():
+            raise ConversionCancelled("cancelled")
 
     def __enter__(self) -> SignalProgress:
         """
@@ -83,6 +97,7 @@ class SignalProgress(QObject):
         Args:
         - steps: How many more steps there will be.
         """
+        self.stop_if_cancelled()
         self.total += steps
         self.progressed.emit(self.done, self.total)
 
@@ -93,6 +108,7 @@ class SignalProgress(QObject):
         Args:
         - what: A few words naming it.
         """
+        self.stop_if_cancelled()
         self.step_started.emit(what)
 
     def finish(self, what: str, status: str = "") -> None:
@@ -106,6 +122,7 @@ class SignalProgress(QObject):
         self.done += 1
         self.step_finished.emit(what, status)
         self.progressed.emit(self.done, self.total)
+        self.stop_if_cancelled()
 
 
 class ConversionWorker(QThread):
@@ -134,7 +151,7 @@ class ConversionWorker(QThread):
         """
         super().__init__(parent)
         self.options = options
-        self.shown = SignalProgress(self)
+        self.shown = SignalProgress(self.isInterruptionRequested, self)
 
     def gather_sources(self) -> list[Path]:
         """
@@ -203,11 +220,15 @@ class ConversionWorker(QThread):
         saved = 0
         for number, source in enumerate(sources, start=1):
             if self.isInterruptionRequested():
-                logger.info("Stopped before %s: the window is closing", source)
+                logger.info("Cancelled before %s", source)
                 break
             self.file_started.emit(number, len(sources), str(source))
             try:
                 outcome, detail = self.convert_source(config, source)
+            except ConversionCancelled:
+                logger.info("Cancelled while converting %s", source)
+                self.file_finished.emit(str(source), CANCELLED, "nothing saved")
+                break
             except ConversionError as error:
                 logger.error("Could not convert %s: %s", source, error, exc_info=True)
                 outcome, detail = FAILED, str(error)
