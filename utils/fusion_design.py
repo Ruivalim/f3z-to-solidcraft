@@ -77,8 +77,14 @@ class Sketch:
     #: Closed chains of curve ids, as the file lists them.  A curve named twice
     #: in one chain is a slit, not a boundary.
     loops: list[list[str]]
+    #: Its points as the file lists them: point id -> (u, v), millimetres.
+    points: dict[str, tuple[float, float]] = field(default_factory=dict)
+    #: Its constraints, as cadmpeg decodes them.
+    constraints: list[dict] = field(default_factory=list)
     #: The name it was drawn under in SolidCraft, once it has been.
     drawn_as: str = ""
+    #: Curve id in the file -> the id SolidCraft gave the curve drawn for it.
+    drawn_ids: dict[str, str] = field(default_factory=dict)
     #: Its regions as SolidCraft finds them: the sample points in each.
     regions: list[list[tuple[float, float]]] | None = None
 
@@ -240,6 +246,12 @@ class Design:
     cylinders: list[tuple[np.ndarray, np.ndarray, float]] = field(default_factory=list)
     #: ASM edge slot -> the end points the file records for it, mm.
     edge_ends: dict[int, list[tuple[np.ndarray, np.ndarray]]] = field(default_factory=dict)
+    #: The document's file name inside the archive, which a design inserting it refers to.
+    source: str = ""
+    #: The documents this one inserts, in order: file name, and where it is placed as a 4x4 matrix in mm.
+    placements: list[tuple[str, np.ndarray]] = field(default_factory=list)
+    #: Id of a native group of picked curves or edges -> how many it holds.
+    group_sizes: dict[str, int] = field(default_factory=dict)
     #: (min xyz, max xyz) of the finished bodies' vertices in mm, as ezf3d reads them.
     bounds: tuple[list[float], list[float]] | None = None
     notes: list[str] = field(default_factory=list)
@@ -306,17 +318,18 @@ def sketch_frame(record: dict, placements: dict[int, list]) -> tuple[np.ndarray,
     return (origin @ normal) * normal, x_dir, y_dir, normal
 
 
-def build_sketch(record: dict, entities: list[dict], placements: dict[int, list]) -> Sketch:
+def build_sketch(record: dict, entities: list[dict], constraints: list[dict], placements: dict[int, list]) -> Sketch:
     """
     Build a sketch from its CADIR records.
 
     Args:
     - record: The sketch's record.
     - entities: The records of its points and curves.
+    - constraints: The definitions of its constraints.
     - placements: Sketch number -> Fusion's own 4x4 matrix for it.
 
     Returns:
-    - The sketch, with its lines, arcs and circles.
+    - The sketch, with its lines, arcs, circles, points and constraints.
     """
     origin, x_dir, y_dir, normal = sketch_frame(record, placements)
     curves = {
@@ -324,8 +337,13 @@ def build_sketch(record: dict, entities: list[dict], placements: dict[int, list]
         for entity in entities
         if entity["geometry"]["kind"] in ("line", "arc", "circle")
     }
+    points = {
+        entity["id"]: (float(entity["geometry"]["position"]["u"]), float(entity["geometry"]["position"]["v"]))
+        for entity in entities
+        if entity["geometry"]["kind"] == "point" and "position" in entity["geometry"]
+    }
     loops = [[item["entity"] for item in loop] for loop in record.get("profiles", [])]
-    return Sketch(record["id"], origin, x_dir, y_dir, normal, curves, loops)
+    return Sketch(record["id"], origin, x_dir, y_dir, normal, curves, loops, points, constraints)
 
 
 def dump_cadir(cadmpeg: Path, f3d: Path) -> dict:
@@ -368,8 +386,11 @@ def read_sketches(design: Design, records: dict, arenas: dict) -> None:
     by_sketch: dict[str, list[dict]] = {}
     for entity in records.get("sketch_entities", []):
         by_sketch.setdefault(entity["sketch"], []).append(entity)
+    constraints: dict[str, list[dict]] = {}
+    for constraint in records.get("sketch_constraints", []):
+        constraints.setdefault(constraint.get("sketch", ""), []).append(constraint.get("definition") or {})
     for record in records.get("sketches", []):
-        design.sketches[record["id"]] = build_sketch(record, by_sketch.get(record["id"], []), placements)
+        design.sketches[record["id"]] = build_sketch(record, by_sketch.get(record["id"], []), constraints.get(record["id"], []), placements)
 
 
 def read_parameters(design: Design, doc) -> list:
@@ -422,6 +443,25 @@ def read_features(design: Design, records: dict, ez_features: list) -> None:
         )
         design.features.append(feature)
         design.feature_ids[record["id"]] = feature
+
+
+def read_placements(design: Design, records: dict) -> None:
+    """
+    Fill in where a design places the documents it inserts.
+
+    Args:
+    - design: The design being read; its `placements` are set.
+    - records: The CADIR ``model`` section.
+    """
+    for occurrence in sorted(records.get("occurrences", []), key=lambda item: item.get("ordinal", 0)):
+        path = occurrence.get("prototype", {}).get("document", {}).get("path")
+        matrix = np.array(occurrence.get("transform") or [], float)
+        if not path or matrix.shape != (4, 4):
+            continue
+        # The translation is in the last column; a matrix that has it in the last row is the other way round.
+        if np.any(np.abs(matrix[3, :3]) > 1e-12) and not np.any(np.abs(matrix[:3, 3]) > 1e-12):
+            matrix = matrix.T
+        design.placements.append((Path(path).name, matrix))
 
 
 def read_cylinders(design: Design, records: dict) -> None:
@@ -484,13 +524,15 @@ def read_design(doc, name: str, linked: bool, f3d: Path, cadir: dict) -> Design:
     Raises:
     - ConversionError: If the dump lacks a section the rebuild cannot do without.
     """
-    design = Design(name=name, linked=linked, f3d=f3d)
+    design = Design(name=name, linked=linked, f3d=f3d, source=Path(str(doc.source).rsplit("!", 1)[-1]).name)
     try:
         records = cadir["model"]
         arenas = cadir.get("native", {}).get("f3d", {}).get("arenas", {})
         read_sketches(design, records, arenas)
         read_features(design, records, read_parameters(design, doc))
         read_cylinders(design, records)
+        read_placements(design, records)
+        design.group_sizes = {group["id"]: len(group.get("members") or []) for group in arenas.get("design_construction_operand_groups", []) if "id" in group}
         collect_edges(arenas, design.edge_ends)
     except (KeyError, TypeError, ValueError) as error:
         logger.error("cadmpeg's dump of %s is not laid out as expected: %r", name, error)

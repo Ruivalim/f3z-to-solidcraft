@@ -10,28 +10,46 @@ This is a personal project. It has no affiliation with Autodesk, Inc. or Fusion 
 
 ## Status
 
-This is an early tool. It has been tested on one `.f3z` file with two parts. Expect gaps on other designs.
+This is an early tool. It has been tested on two designs, with SolidCraft 0.6.0. Expect gaps on other designs.
+
+| Design | Timeline steps | Failed | Skipped | Volume against the original |
+|---|---|---|---|---|
+| A `.f3z` with two parts (a base and a corner mount) | 3 and 15 | 0 | 0 | Base: matches. Mount: 45006.9 against 45330.7 mm3 |
+| A `.f3d` sensor case | 15 | 0 | 0 | 8958.0 against 8951.3 mm3 |
+
+Neither design matches its original fully yet. The most likely cause is the SolidCraft fillet and chamfer limit under Known limits.
 
 What is rebuilt today:
 
 * Parameters
 * Sketches (lines, arcs and circles, on their real planes)
+* Sketch constraints: coincident, horizontal, vertical, parallel, perpendicular, tangent, equal, concentric, collinear, midpoint and symmetric
+* Sketch dimensions (lengths, radii and diameters), driven by the same parameters as in Fusion
 * Extrudes (new body, join and cut)
+* Sweeps of a sketch region along sketch curves
 * Fillets
+* Chamfers of equal distance, including round edges
 * Holes
 * Work planes (as offset planes)
-* Linked components
+* Linked components, moved and turned to where the design places them
 
 What is not rebuilt yet:
 
-* Sketch constraints and dimensions
-* Any other feature type (revolve, sweep, loft, chamfer, shell, patterns and so on). These are listed as skipped in the report.
-* The position of a linked component. Linked components are placed at the origin.
+* Any other feature type (revolve, loft, shell, patterns and so on). These are listed as skipped in the report.
+* Sketch offset constraints. SolidCraft has no command for them.
+* Chamfers of two distances or of a distance and an angle.
+* A linked component that is mirrored or scaled. It is left at the origin.
 
-Known limits in the test file:
+Known limits:
 
-* SolidCraft refuses to fillet some edge combinations that Fusion accepts. The converter rounds the edges SolidCraft allows and reports the rest.
-* SolidCraft's "hole at sketch points" mode removes the wrong material. The converter makes one hole feature per position instead.
+* The file gives a dimension's value but not what it measures. The converter puts each dimension on a curve of that size, and leaves out a dimension when no curve has it. A dimension between two points or two curves is therefore not placed.
+* A constraint or dimension is kept only if the sketch stays exactly where it was drawn. One that SolidCraft refuses, or that moves a curve, is taken back and counted in the report.
+* The file does not say which region a sweep carries, and names its path only by the number of curves. Both are worked out from the finished solid and the drawn sketches.
+* The placement of a linked component has only been tested on a component placed at the origin. A moved or turned placement is checked against what SolidCraft reports, but the units cadmpeg gives it in are assumed to be millimetres.
+* SolidCraft refuses to fillet or chamfer some edge combinations that Fusion accepts. The converter treats the edges SolidCraft allows and reports the rest. This is still so in SolidCraft 0.6.
+* SolidCraft's "hole at sketch points" mode removes the wrong material. The converter makes one hole feature per position instead. This is still so in SolidCraft 0.6.
+* When two extrudes use the same sketch, the file may not say which regions each one takes. The converter gives a region to the later extrude when its material in the finished solid stops short of the earlier extrude's length.
+* A fillet or chamfer whose edges are on material an earlier failed step should have made is reported as failed. It does not guess other edges instead.
 
 ## How it works
 
@@ -232,6 +250,7 @@ requirements.txt     Python dependencies
 utils/
   converter.py           Reads the file, rebuilds it, reports, saves or opens
   timeline_builder.py    Turns each Fusion timeline step into SolidCraft commands
+  sketch_constraints.py  Adds a sketch's constraints and dimensions to the drawn sketch
   fusion_design.py       Reads a Fusion document through cadmpeg and ezf3d
   solvecraft_session.py  Configuration and the session with solidcraft-cli
   solid_oracle.py        Questions asked of the finished solid

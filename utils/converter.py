@@ -31,7 +31,7 @@ from .conversion_common import (
     slug,
 )
 from .conversion_errors import ConversionError
-from .fusion_design import dump_cadir, read_design
+from .fusion_design import Design, dump_cadir, read_design
 from .logging_utils import AppLogger
 from .solid_oracle import Mesh
 from .solvecraft_session import Config, Session, load_config
@@ -283,13 +283,13 @@ def rebuild(config: Config, parts: list[Part], work: Path, shown: Progress) -> S
     - ConversionError: If SolidCraft cannot be started or stops answering.
     """
     session = Session(config.cli)
-    components: list[str] = []
+    components: list[Design] = []
     for part in parts:
         design = part.design
         part.outcomes, part.result = [], None
         if design.linked:
             session.execute("component.create", {"name": design.name})
-            components.append(design.name)
+            components.append(design)
         builder = Builder(session, part, work, [] if design.linked else components, shown)
         if part.route == "history":
             builder.run()
