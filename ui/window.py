@@ -159,7 +159,7 @@ class ConverterWindow(QMainWindow):
         layout.setSpacing(10)
 
         self.output_field = PathField("Choose where designs are saved", "Next to each source file")
-        self.output_field.setToolTip("Each source saves NAME.solvecraft, NAME.script.json and NAME.report.txt here")
+        self.output_field.setToolTip("Each source saves NAME.solidcraft, NAME.script.json and NAME.report.txt here")
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from utils.conversion_common import DESIGN_SUFFIX
 from utils.conversion_errors import ConversionError
 from utils.converter import check, convert, find_sources, make_work_folder, report, save_result
 from utils.solvecraft_session import Config, load_config
@@ -174,7 +175,7 @@ class ConversionWorker(QThread):
         Raises:
         - ConversionError: If the file cannot be converted or saved.
         """
-        design = (config.output_dir or source.parent) / f"{source.stem}.solvecraft"
+        design = (config.output_dir or source.parent) / f"{source.stem}{DESIGN_SUFFIX}"
         # Asked before converting: a conversion takes minutes.
         if design.exists() and not self.options.force:
             logger.info("%s exists and was not overwritten", design)

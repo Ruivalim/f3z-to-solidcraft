@@ -146,7 +146,7 @@ Run `main.py --help` for the full list of options.
 
 | Option | What it does |
 |---|---|
-| `--save [PATH]` | Save without asking. `PATH` is the `.solvecraft` file and is for a single file only. |
+| `--save [PATH]` | Save without asking. `PATH` is the `.solidcraft` file and is for a single file only. Give it a `.json` name to save plain JSON instead (SolidCraft 0.6 and newer). |
 | `--open` | Open the result in the SolidCraft UI |
 | `--force` | Overwrite an existing design |
 | `--recursive` | With a folder, include its subfolders |
@@ -163,7 +163,7 @@ Run `main.py --help` for the full list of options.
 
 ```yaml
 # Folder holding solidcraft-cli.exe and solidcraft.exe.
-solidcraft_dir: 'C:\Tools\solidcraft-0.5.0-windows-x64-portable'
+solidcraft_dir: 'C:\Tools\solidcraft-0.6.0-windows-x64-portable'
 
 # Path of cadmpeg.exe. "make cadmpeg" installs it here.
 cadmpeg: '%LOCALAPPDATA%\f3z-to-solidcraft\cadmpeg\bin\cadmpeg.exe'
@@ -180,7 +180,7 @@ Saving writes three files side by side:
 
 | File | Contents |
 |---|---|
-| `NAME.solvecraft` | The SolidCraft design |
+| `NAME.solidcraft` | The SolidCraft design |
 | `NAME.script.json` | The commands that build the design. You can replay it with `solidcraft-cli run`. |
 | `NAME.report.txt` | What became of every timeline step, and the check against the original |
 
@@ -192,6 +192,8 @@ RESULT: NOT every part matches its original
 ```
 
 A part matches when its volume and bounding box equal those of the original solid.
+
+SolidCraft 0.6 and newer save the design as a zip container. SolidCraft 0.5 and older cannot open it, as a container or as JSON. Older builds still work with the converter: they write plain JSON under the same `.solidcraft` name. Designs saved as `.solvecraft` by earlier versions of the converter still open in every build.
 
 ## Logs
 

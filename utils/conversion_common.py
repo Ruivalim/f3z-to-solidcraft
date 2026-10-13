@@ -17,6 +17,11 @@ from .solid_oracle import Mesh
 APP_NAME = "f3z-to-solidcraft"
 # Name of the log file, without extension.
 SCRIPT_NAME = "f3z2solvecraft"
+# Extension of a saved design. SolidCraft 0.6 writes it as a zip container; older builds write plain JSON under the same name.
+DESIGN_SUFFIX = ".solidcraft"
+# Extensions a design may be saved under when asked for by name: .json makes
+# SolidCraft 0.6 write plain JSON, .solvecraft is the extension from before 0.6.
+DESIGN_SUFFIXES = {DESIGN_SUFFIX, ".json", ".solvecraft"}
 
 # Bounding boxes closer than this (mm) count as the same size.
 BOUNDS_TOLERANCE = 0.05

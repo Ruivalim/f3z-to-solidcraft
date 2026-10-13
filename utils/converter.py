@@ -15,7 +15,21 @@ from pathlib import Path
 import ezf3d
 from ezf3d.container.archive import F3DArchive
 
-from .conversion_common import EXACT, FAILED, INFERRED, SCRIPT_NAME, SKIPPED, BOUNDS_TOLERANCE, Part, Progress, default_paths, measured, slug
+from .conversion_common import (
+    BOUNDS_TOLERANCE,
+    DESIGN_SUFFIX,
+    DESIGN_SUFFIXES,
+    EXACT,
+    FAILED,
+    INFERRED,
+    SCRIPT_NAME,
+    SKIPPED,
+    Part,
+    Progress,
+    default_paths,
+    measured,
+    slug,
+)
 from .conversion_errors import ConversionError
 from .fusion_design import dump_cadir, read_design
 from .logging_utils import AppLogger
@@ -45,7 +59,8 @@ HELP_EPILOG = """\
 examples:
   main.py design.f3z                         convert, then ask whether to save or open
   main.py design.f3z --save                  save next to design.f3z without asking
-  main.py design.f3z --save out\\part.solvecraft --force
+  main.py design.f3z --save out\\part.solidcraft --force
+  main.py design.f3z --save out\\part.json         save the design as plain JSON (SolidCraft 0.6+)
   main.py design.f3z --open                  open a temporary copy in the SolidCraft UI
   main.py design.f3z --save --exact-on-mismatch
   main.py design.f3z --solidcraft-dir C:\\Tools\\solidcraft --output-dir D:\\Converted
@@ -53,8 +68,10 @@ examples:
   main.py C:\\Archive --recursive --save --output-dir D:\\Converted --force
   main.py --gui                              open a window to drop files or folders on
 
-saving writes three files side by side: NAME.solvecraft (the design),
+saving writes three files side by side: NAME.solidcraft (the design),
 NAME.script.json (the commands that build it) and NAME.report.txt.
+SolidCraft 0.6 and newer write the design as a zip container, which 0.5 and
+older cannot open; older builds write plain JSON under the same name.
 
 a folder is converted file by file; one that fails is reported and the rest
 carry on, and a summary is printed at the end. With --output-dir, files of the
@@ -390,7 +407,8 @@ def save_design(config: Config, script: Path, design: Path) -> None:
     Args:
     - config: Where SolidCraft is.
     - script: The script.
-    - design: Where the .solvecraft design is saved.
+    - design: Where the design is saved; SolidCraft 0.6 writes plain JSON
+      for a ``.json`` name and a zip container for any other.
 
     Raises:
     - ConversionError: If SolidCraft cannot be run or fails to build or save the design.
@@ -477,7 +495,8 @@ def choose_target(args, default: Path, ask_path: bool = True) -> Path | None:
     - ask_path: Whether the place may be asked for; False when converting a folder.
 
     Returns:
-    - The .solvecraft path, or None when an existing design is not to be overwritten.
+    - The design's path, or None when an existing design is not to be overwritten.
+      A name given with ``.json`` or ``.solvecraft`` keeps it; any other ends in ``.solidcraft``.
     """
     target = Path(args.save) if args.save else None
     # --save without a path means the default place, without asking; the place
@@ -485,7 +504,9 @@ def choose_target(args, default: Path, ask_path: bool = True) -> Path | None:
     if ask_path and args.save is None and sys.stdin.isatty():
         typed = ask(f"Save as [{default}]: ").strip('"')
         target = Path(typed) if typed else None
-    design = (target or default).with_suffix(".solvecraft")
+    design = target or default
+    if design.suffix.lower() not in DESIGN_SUFFIXES:
+        design = design.with_suffix(DESIGN_SUFFIX)
     if design.exists() and not args.force:
         if not sys.stdin.isatty() or ask(f"{design} exists. Overwrite? [y/N]: ").lower() != "y":
             print("Not overwritten (use --force).")
@@ -503,7 +524,7 @@ def save_result(config: Config, source: Path, commands: list[dict], text: str, d
     - source: The Fusion file.
     - commands: The commands that rebuilt the design.
     - text: The report.
-    - design: Where the .solvecraft design is saved.
+    - design: Where the design is saved.
     - also_open: Whether to open the saved design in the UI.
 
     Raises:
@@ -536,7 +557,7 @@ def open_result(config: Config, source: Path, commands: list[dict], work: Path) 
     Raises:
     - ConversionError: If a file cannot be written or SolidCraft fails.
     """
-    script, design = work / f"{source.stem}.script.json", work / f"{source.stem}.solvecraft"
+    script, design = work / f"{source.stem}.script.json", work / f"{source.stem}{DESIGN_SUFFIX}"
     write_script(commands, source, script)
     save_design(config, script, design)
     open_design(config, design)
@@ -563,7 +584,7 @@ def finish(config: Config, source: Path, commands: list[dict], work: Path, text:
     decided = choice is not None
     choice = choice if decided else choose_action(args)
     if choice == "s":
-        design = choose_target(args, (config.output_dir or source.parent) / f"{source.stem}.solvecraft", ask_path=not decided)
+        design = choose_target(args, (config.output_dir or source.parent) / f"{source.stem}{DESIGN_SUFFIX}", ask_path=not decided)
         if design is not None:
             save_result(config, source, commands, text, design, args.open)
     elif choice == "o":
@@ -657,7 +678,7 @@ def parse_arguments() -> argparse.Namespace:
         nargs="?",
         const="",
         metavar="PATH",
-        help="save the design, its script and the report without asking; PATH is the .solvecraft file, for a single file only "
+        help="save the design, its script and the report without asking; PATH is the .solidcraft file, or a .json name for plain JSON, for a single file only "
         "(default: the source's name in the output folder)",
     )
     result.add_argument("--open", action="store_true", help="open the result in the SolidCraft UI; with --save, opens the saved design")
