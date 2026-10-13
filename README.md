@@ -120,6 +120,18 @@ make save FILE="C:\path\to\design.f3z" ARGS="--output-dir D:\Converted --force"
 
 One file takes about two minutes in the test case.
 
+### Window
+
+Open a window instead of converting at the terminal:
+
+```
+make gui
+```
+
+Drop `.f3z` or `.f3d` files, or folders of them, on the window. The export options then appear: where to save, and whether to open each design in SolidCraft. The Advanced section holds the rest: subfolders, overwriting, inserting the original solid on a mismatch, and the SolidCraft and cadmpeg paths. Press Convert. The window always saves; a design that already exists is left alone unless Overwrite is ticked.
+
+The fields start from `config.yaml` and from any options given with `--gui`. What you change in the window lasts until it is closed.
+
 ### Without make
 
 `main.py` is the only entry point. Run it with the project's Python environment:
@@ -138,6 +150,7 @@ Run `main.py --help` for the full list of options.
 | `--open` | Open the result in the SolidCraft UI |
 | `--force` | Overwrite an existing design |
 | `--recursive` | With a folder, include its subfolders |
+| `--gui` | Open the window. `SOURCE` is optional and the other options set what the window starts with. |
 | `--exact-on-mismatch` | If a part's rebuilt history does not match the original solid, insert the original solid instead. That part then has no feature history. |
 | `--config FILE` | Use another configuration file |
 | `--solidcraft-dir DIR` | Override `solidcraft_dir` from the configuration |
@@ -196,6 +209,7 @@ Show the last lines with `make log`. Remove the log files with `make clean-logs`
 |---|---|
 | `make help` | List the targets |
 | `make run`, `make save`, `make open` | Convert a `FILE` or a `FOLDER` |
+| `make gui` | Open the window |
 | `make setup` | Run the setup script (`tools\setup.ps1` on Windows, `tools/setup.sh` elsewhere): the Python environment, cadmpeg, then the check |
 | `make create-venv` | Create the Python environment and install dependencies |
 | `make recreate-venv` | Delete the Python environment and build it again |
@@ -222,6 +236,11 @@ utils/
   conversion_common.py   Shared settings, measurements, results and progress display
   conversion_errors.py   The error raised when a conversion cannot go on
   logging_utils.py       Rotating log file handler
+ui/
+  window.py              The window opened by --gui
+  conversion_worker.py   Runs conversions off the window's thread
+  theme.py               Dark and light style sheets
+  widgets/               Drop zone, collapsible section, path field
 vendor/ezf3d/        The ezf3d library
 ```
 

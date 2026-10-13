@@ -51,6 +51,7 @@ examples:
   main.py design.f3z --solidcraft-dir C:\\Tools\\solidcraft --output-dir D:\\Converted
   main.py C:\\Archive --save                  convert every .f3z/.f3d in the folder, saving each beside its source
   main.py C:\\Archive --recursive --save --output-dir D:\\Converted --force
+  main.py --gui                              open a window to drop files or folders on
 
 saving writes three files side by side: NAME.solvecraft (the design),
 NAME.script.json (the commands that build it) and NAME.report.txt.
@@ -571,7 +572,24 @@ def finish(config: Config, source: Path, commands: list[dict], work: Path, text:
         logger.info("Nothing saved or opened")
 
 
-def convert(config: Config, source: Path, work: Path, exact_on_mismatch: bool) -> tuple[list[Part], list[dict]]:
+def make_work_folder() -> Path:
+    """
+    Create the temporary folder one conversion works in.
+
+    Returns:
+    - The new folder.
+
+    Raises:
+    - ConversionError: If the folder cannot be created.
+    """
+    try:
+        return Path(tempfile.mkdtemp(prefix="f3z2solvecraft-"))
+    except OSError as error:
+        logger.error("Could not create a temporary folder: %s", error)
+        raise ConversionError(f"could not create a temporary folder: {error}") from error
+
+
+def convert(config: Config, source: Path, work: Path, exact_on_mismatch: bool, display: Progress | None = None) -> tuple[list[Part], list[dict]]:
     """
     Read a Fusion file and rebuild it in SolidCraft.
 
@@ -581,6 +599,8 @@ def convert(config: Config, source: Path, work: Path, exact_on_mismatch: bool) -
     - work: A folder for temporary files.
     - exact_on_mismatch: Whether a part whose rebuilt history does not match
       its original gets the original solid inserted instead.
+    - display: Where progress is shown; None for the bar on the terminal. The
+      window passes its own, which has the same methods.
 
     Returns:
     - The parts with their outcomes, and the commands that rebuilt the design.
@@ -588,7 +608,7 @@ def convert(config: Config, source: Path, work: Path, exact_on_mismatch: bool) -
     Raises:
     - ConversionError: If the file cannot be read or SolidCraft fails.
     """
-    with Progress() as shown:
+    with display if display is not None else Progress() as shown:
         parts = read_parts(config, source, work, shown)
         for part in parts:
             shown.start(f"{part.design.name}: converting the original solid")
@@ -623,8 +643,13 @@ def parse_arguments() -> argparse.Namespace:
         epilog=HELP_EPILOG.format(config=DEFAULT_CONFIG, log=default_paths()["log_dir"] / f"{SCRIPT_NAME}.log"),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("source", type=Path, metavar="SOURCE", help="the Fusion .f3z or .f3d file to convert, or a folder of them")
+    parser.add_argument("source", type=Path, nargs="?", metavar="SOURCE", help="the Fusion .f3z or .f3d file to convert, or a folder of them; optional with --gui")
     parser.add_argument("--recursive", action="store_true", help="when SOURCE is a folder, convert the files in its subfolders too")
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="open a window to drop files or folders on instead of converting at the terminal; SOURCE and the other options set what the window starts with",
+    )
 
     result = parser.add_argument_group("what to do with the result (asked when neither is given: at the end for a file, once at the start for a folder)")
     result.add_argument(
@@ -656,7 +681,25 @@ def parse_arguments() -> argparse.Namespace:
     )
     settings.add_argument("--cadmpeg", metavar="FILE", help="path of cadmpeg.exe")
     settings.add_argument("--output-dir", metavar="DIR", help="folder saved designs go to (default: beside each source file)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.source is None and not args.gui:
+        parser.error("SOURCE is required unless --gui is given")
+    return args
+
+
+def config_path(args: argparse.Namespace) -> Path | None:
+    """
+    Decide which configuration file is read.
+
+    Args:
+    - args: The command line.
+
+    Returns:
+    - The file named by ``--config``, else config.yaml beside main.py when there is one, else None.
+    """
+    if args.config is not None:
+        return args.config
+    return DEFAULT_CONFIG if DEFAULT_CONFIG.is_file() else None
 
 
 def configuration(args: argparse.Namespace) -> Config:
@@ -672,11 +715,8 @@ def configuration(args: argparse.Namespace) -> Config:
     Raises:
     - ConversionError: If the file cannot be read or a tool is not where the settings say.
     """
-    path = args.config
-    if path is None and DEFAULT_CONFIG.is_file():
-        path = DEFAULT_CONFIG
     overrides = {"solidcraft_dir": args.solidcraft_dir, "cadmpeg": args.cadmpeg, "output_dir": args.output_dir}
-    return load_config(path, overrides)
+    return load_config(config_path(args), overrides)
 
 
 def convert_file(config: Config, source: Path, args: argparse.Namespace, choice: str | None = None) -> bool:
@@ -696,10 +736,7 @@ def convert_file(config: Config, source: Path, args: argparse.Namespace, choice:
     - ConversionError: If the conversion cannot be done.
     """
     logger.info("Converting %s", source)
-    try:
-        work = Path(tempfile.mkdtemp(prefix="f3z2solvecraft-"))
-    except OSError as error:
-        raise ConversionError(f"could not create a temporary folder: {error}") from error
+    work = make_work_folder()
     parts, commands = convert(config, source, work, args.exact_on_mismatch)
     text = report(parts)
     logger.info("Report for %s:\n%s", source.name, text)
@@ -796,6 +833,30 @@ def run(args: argparse.Namespace) -> int:
     return convert_folder(configuration(args), find_sources(source, args.recursive), args)
 
 
+def run_gui(args: argparse.Namespace, log_path: Path) -> int:
+    """
+    Open the converter's window and wait until it is closed.
+
+    Args:
+    - args: The command line; it sets what the window starts with.
+    - log_path: The log file, which the window points to.
+
+    Returns:
+    - Always 0: the window reports files that could not be converted itself.
+
+    Raises:
+    - ConversionError: If PySide6, which the window is built with, is not installed.
+    """
+    try:
+        # Imported here so converting at the terminal does not need PySide6.
+        from ui.window import launch
+    except ImportError as error:
+        logger.error("The window could not be loaded: %r", error)
+        raise ConversionError(f"--gui needs PySide6, which could not be loaded ({error}); run make create-venv to install it") from error
+    logger.info("Window closed with code %s", launch(args, log_path))
+    return 0
+
+
 def main() -> int:
     """
     Run the converter, logging its start, its end and anything that stops it.
@@ -811,7 +872,7 @@ def main() -> int:
         return 1
     logger.info("Started: %s", " ".join(sys.argv))
     try:
-        failed = run(args)
+        failed = run_gui(args, log_path) if args.gui else run(args)
     except ConversionError as error:
         logger.error("Stopped: %s", error, exc_info=True)
         print(f"error: {error} (details in {log_path})", file=sys.stderr)

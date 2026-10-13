@@ -15,6 +15,7 @@ The main idea and implementation was done by me, but I used claude to help with 
 
 Usage: 
 main.py SOURCE [--save [PATH]] [--open] [--force] [--exact-on-mismatch]
+main.py --gui
 
 """
 

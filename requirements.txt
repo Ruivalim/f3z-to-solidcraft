@@ -3,5 +3,7 @@
 numpy
 rich
 pyyaml
+# main.py --gui
+PySide6
 # make lint
 flake8

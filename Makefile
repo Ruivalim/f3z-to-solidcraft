@@ -1,4 +1,4 @@
-.PHONY: help run save open setup create-venv recreate-venv activate-venv cadmpeg check lint log clean clean-logs
+.PHONY: help run save open gui setup create-venv recreate-venv activate-venv cadmpeg check lint log clean clean-logs
 
 MAIN := main.py
 
@@ -51,6 +51,7 @@ help:
 	@echo                          Use FOLDER=... instead of FILE=... to convert every .f3z/.f3d in a folder;
 	@echo                          add RECURSIVE=1 to include its subfolders
 	@echo                          Add ARGS="--exact-on-mismatch" or other main.py options
+	@echo   make gui             - Open the window to drop files or folders on; FILE or FOLDER starts it with one
 	@echo   make setup           - Install everything: the Python environment, cadmpeg, then check
 	@echo   make create-venv     - Create the Python environment if missing and install dependencies
 	@echo   make recreate-venv   - Delete and rebuild the Python environment from scratch
@@ -82,6 +83,10 @@ save:
 open:
 	@$(PYTHON) $(MAIN) "$(SOURCE)" --open $(ARGS)
 
+# The window needs no source; one given is listed in it when it opens.
+gui:
+	@$(PYTHON) $(MAIN) --gui $(if $(strip $(SOURCE)),"$(SOURCE)") $(ARGS)
+
 # The setup script holds the versions (Python, cadmpeg, the Rust toolchain) and
 # logs each step to $(APP_DIR)\logs\setup.log.
 setup:
@@ -110,8 +115,8 @@ check:
 
 # Two passes, as QSnippet's lint does: blocking on real errors, advisory on style.
 lint:
-	$(PYTHON) -m flake8 $(MAIN) utils --select=E9,F63,F7,F82 --show-source
-	$(PYTHON) -m flake8 $(MAIN) utils --exit-zero --max-line-length 170
+	$(PYTHON) -m flake8 $(MAIN) utils ui --select=E9,F63,F7,F82 --show-source
+	$(PYTHON) -m flake8 $(MAIN) utils ui --exit-zero --max-line-length 170
 
 log:
 	@if exist "$(LOG_FILE)" (powershell -NoProfile -Command "Get-Content -LiteralPath '$(LOG_FILE)' -Tail 40") else (echo No log yet at $(LOG_FILE))

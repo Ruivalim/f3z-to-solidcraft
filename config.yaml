@@ -1,6 +1,6 @@
 # Folder holding solidcraft-cli.exe and solidcraft.exe
 # (solvecraft-cli.exe and solvecraft.exe before SolidCraft 0.5).
-solidcraft_dir: 'path\to\solidcraft-cli.exe'
+solidcraft_dir: 'C:\Users\Quynn\Downloads\solidcraft-0.5.0-windows-x64-portable'
 
 # cadmpeg.exe: decodes the Fusion timeline and writes each part's original
 # solid as STEP, which the rebuild is checked against. `make cadmpeg` installs it here.
