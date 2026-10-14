@@ -282,7 +282,7 @@ def rebuild(config: Config, parts: list[Part], work: Path, shown: Progress) -> S
     Raises:
     - ConversionError: If SolidCraft cannot be started or stops answering.
     """
-    session = Session(config.cli)
+    session = Session(config.cli, [work] + [part.step.parent for part in parts if part.step is not None])
     components: list[Design] = []
     try:
         for part in parts:

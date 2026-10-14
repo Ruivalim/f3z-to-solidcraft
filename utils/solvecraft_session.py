@@ -150,19 +150,22 @@ class Session:
     A headless design session: `solidcraft-cli mcp`, one JSON-RPC message per line.
     """
 
-    def __init__(self, cli: Path) -> None:
+    def __init__(self, cli: Path, folders: list[Path]) -> None:
         """
         Start SolidCraft and open the session.
 
         Args:
         - cli: The ``solidcraft-cli`` executable.
+        - folders: The folders the session reads and writes files in.
 
         Raises:
         - ConversionError: If SolidCraft cannot be started or does not answer.
         """
+        # SolidCraft after 0.9.0 keeps a session's files to the folders it is told of; earlier ones ignore the option.
+        allowed = [word for folder in dict.fromkeys(folders) for word in ("--allow-path", str(folder))]
         try:
             self.process = subprocess.Popen(
-                [str(cli), "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8"
+                [str(cli), "mcp", *allowed], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8"
             )
         except OSError as error:
             logger.error("Could not start %s: %s", cli, error)
