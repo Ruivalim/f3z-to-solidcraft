@@ -5,6 +5,7 @@ import logging
 import math
 import struct
 import subprocess
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,6 +22,17 @@ CM_TO_MM = 10.0
 ARC_CHORDS = 48
 #: What ezf3d raises on a record it cannot read.
 EZF3D_ERRORS = (model.Ef3dError, struct.error, ValueError, KeyError, IndexError)
+#: Timeline tags as a Fusion set to Portuguese writes them, by the English tag
+#: the timeline builder knows. cadmpeg passes the tag on in the file's language.
+LOCALIZED_KINDS = {
+    "Esboço": "Sketch",
+    "Extrusão": "Extrude",
+    "Arredondamento": "Fillet",
+    "Chanfro": "Chamfer",
+    "Varredura": "Sweep",
+    "Furo": "Hole",
+    "Plano de trabalho": "WorkPlane",
+}
 
 
 @dataclass
@@ -418,6 +430,19 @@ def read_parameters(design: Design, doc) -> list:
         return []
 
 
+def feature_kind(tag: str) -> str:
+    """
+    Name a timeline entry's type the way the timeline builder does.
+
+    Args:
+    - tag: cadmpeg's ``source_tag``, in the language Fusion was set to.
+
+    Returns:
+    - The English tag; one with no translation known is returned as it is.
+    """
+    return LOCALIZED_KINDS.get(unicodedata.normalize("NFC", tag), tag)
+
+
 def read_features(design: Design, records: dict, ez_features: list) -> None:
     """
     Fill in a design's timeline.
@@ -436,7 +461,7 @@ def read_features(design: Design, records: dict, ez_features: list) -> None:
         feature = Feature(
             ordinal=record["ordinal"],
             name=record.get("name") or record.get("source_tag") or f"Feature {record['ordinal'] + 1}",
-            kind=record.get("source_tag") or "",
+            kind=feature_kind(record.get("source_tag") or ""),
             definition=record.get("definition") or {},
             dependencies=record.get("dependencies") or [],
             ez=ez_features[record["ordinal"]] if aligned else None,

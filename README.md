@@ -35,6 +35,7 @@ What is rebuilt today:
 * Holes
 * Work planes (as offset planes)
 * Linked components, moved and turned to where the design places them
+* Timelines saved by a Fusion set to Portuguese, whose steps are named in that language (Esboço, Extrusão and so on)
 
 What is not rebuilt yet:
 
